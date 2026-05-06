@@ -17,6 +17,7 @@ import (
 )
 
 func main() {
+
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -24,22 +25,40 @@ func main() {
 	)
 	defer stop()
 
+	// --------------------------------------------------
+	// Load config
+	// --------------------------------------------------
+
 	cfg, err := config.Load("config.yaml")
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		log.Fatalf(
+			"Failed to load config: %v",
+			err,
+		)
 	}
 
 	if cfg.DatabaseURL == "" {
-		log.Fatal("DATABASE_URL is required (via config.yaml or environment variable)")
+		log.Fatal(
+			"DATABASE_URL is required",
+		)
 	}
 
 	if cfg.RPCURL == "" {
-		log.Fatal("RPC_URL is required (via config.yaml or environment variable)")
+		log.Fatal(
+			"RPC_URL is required",
+		)
 	}
+
+	// --------------------------------------------------
+	// Parse RPC URL
+	// --------------------------------------------------
 
 	u, err := url.Parse(cfg.RPCURL)
 	if err != nil {
-		log.Fatalf("Invalid RPC_URL: %v", err)
+		log.Fatalf(
+			"Invalid RPC_URL: %v",
+			err,
+		)
 	}
 
 	rpcPass, _ := u.User.Password()
@@ -52,16 +71,35 @@ func main() {
 		u.Path,
 	)
 
-	dbConfig, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	// --------------------------------------------------
+	// PostgreSQL pool
+	// --------------------------------------------------
+
+	dbConfig, err := pgxpool.ParseConfig(
+		cfg.DatabaseURL,
+	)
 	if err != nil {
-		log.Fatalf("Unable to parse DATABASE_URL: %v", err)
+		log.Fatalf(
+			"Unable to parse DATABASE_URL: %v",
+			err,
+		)
 	}
 
-	pool, err := pgxpool.NewWithConfig(ctx, dbConfig)
+	pool, err := pgxpool.NewWithConfig(
+		ctx,
+		dbConfig,
+	)
 	if err != nil {
-		log.Fatalf("Unable to connect to database: %v", err)
+		log.Fatalf(
+			"Unable to connect to database: %v",
+			err,
+		)
 	}
 	defer pool.Close()
+
+	// --------------------------------------------------
+	// RPC client
+	// --------------------------------------------------
 
 	rpcClient := rpc.NewClient(
 		rpcEndpoint,
@@ -69,30 +107,83 @@ func main() {
 		rpcPass,
 	)
 
-	dbWriter := db.NewWriter(pool, true)
+	// --------------------------------------------------
+	// DB writer
+	// --------------------------------------------------
+
+	dbWriter := db.NewWriter(
+		pool,
+		true, // historical sync mode
+	)
+
+	// --------------------------------------------------
+	// Get latest indexed height
+	// --------------------------------------------------
+
 	lastHeight, err := dbWriter.GetLastHeight(ctx)
 	if err != nil {
-		log.Fatalf("Failed to get last height: %v", err)
+		log.Fatalf(
+			"Failed to get last height: %v",
+			err,
+		)
 	}
 
-	startHeight := lastHeight + 1
+	log.Printf(
+		"Latest indexed height: %d",
+		lastHeight,
+	)
+
+	// --------------------------------------------------
+	// Determine start height
+	// --------------------------------------------------
+
+	var startHeight int32
+
+	// Empty DB -> start from genesis
+	if lastHeight == 0 {
+
+		var genesisExists bool
+
+		err = pool.QueryRow(
+			ctx,
+			"SELECT EXISTS(SELECT 1 FROM blocks WHERE height = 0)",
+		).Scan(&genesisExists)
+
+		if err != nil {
+			log.Fatalf(
+				"Failed checking genesis block: %v",
+				err,
+			)
+		}
+
+		if genesisExists {
+			startHeight = 1
+		} else {
+			startHeight = 0
+		}
+
+	} else {
+
+		// Continue from next block
+		startHeight = lastHeight + 1
+	}
 
 	// --------------------------------------------------
 	// Manual override logic
 	// --------------------------------------------------
 
-	if cfg.StartHeight > 0 {
+	if cfg.StartHeight >= 0 {
 
 		log.Printf(
 			"Manual start height requested: %d",
 			cfg.StartHeight,
 		)
 
-		// requested height already indexed
+		// If already indexed
 		if cfg.StartHeight <= lastHeight {
 
 			log.Printf(
-				"Block %d already indexed (DB latest: %d)",
+				"Requested height already indexed | requested=%d latest=%d",
 				cfg.StartHeight,
 				lastHeight,
 			)
@@ -100,7 +191,7 @@ func main() {
 			startHeight = lastHeight + 1
 
 			log.Printf(
-				"Continuing from latest indexed height: %d",
+				"Continuing from next height: %d",
 				startHeight,
 			)
 
@@ -121,7 +212,7 @@ func main() {
 		)
 
 		log.Printf(
-			"Continuing from latest indexed height: %d",
+			"Continuing from computed start height: %d",
 			startHeight,
 		)
 	}
@@ -131,6 +222,10 @@ func main() {
 		startHeight,
 	)
 
+	// --------------------------------------------------
+	// Pipeline
+	// --------------------------------------------------
+
 	p := pipeline.NewPipeline(
 		rpcClient,
 		dbWriter,
@@ -138,7 +233,20 @@ func main() {
 		cfg.BatchSize,
 	)
 
+	log.Printf(
+		"Starting pipeline | workers=%d batch_size=%d",
+		cfg.Workers,
+		cfg.BatchSize,
+	)
+
+	// --------------------------------------------------
+	// Run
+	// --------------------------------------------------
+
 	if err := p.Run(ctx, startHeight); err != nil {
-		log.Fatalf("Pipeline error: %v", err)
+		log.Fatalf(
+			"Pipeline error: %v",
+			err,
+		)
 	}
 }
