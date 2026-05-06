@@ -1,5 +1,5 @@
 database_url: "postgres://hornet:H0rnSt%40r@localhost:5432/btcindex?sslmode=disable"
 rpc_url: "http://hornet:H0rnSt%40r@mustang:8332"
-workers: 2
+workers: 12
 batch_size: 2
-start_height: 600010
+start_height: 600015

@@ -69,8 +69,7 @@ func main() {
 		rpcPass,
 	)
 
-	dbWriter := db.NewWriter(pool)
-
+	dbWriter := db.NewWriter(pool, true)
 	lastHeight, err := dbWriter.GetLastHeight(ctx)
 	if err != nil {
 		log.Fatalf("Failed to get last height: %v", err)
@@ -78,12 +77,57 @@ func main() {
 
 	startHeight := lastHeight + 1
 
-	if os.Getenv("START_HEIGHT") != "" || cfg.StartHeight > 0 {
-		startHeight = cfg.StartHeight
+	// --------------------------------------------------
+	// Manual override logic
+	// --------------------------------------------------
+
+	if cfg.StartHeight > 0 {
+
+		log.Printf(
+			"Manual start height requested: %d",
+			cfg.StartHeight,
+		)
+
+		// requested height already indexed
+		if cfg.StartHeight <= lastHeight {
+
+			log.Printf(
+				"Block %d already indexed (DB latest: %d)",
+				cfg.StartHeight,
+				lastHeight,
+			)
+
+			startHeight = lastHeight + 1
+
+			log.Printf(
+				"Continuing from latest indexed height: %d",
+				startHeight,
+			)
+
+		} else {
+
+			startHeight = cfg.StartHeight
+
+			log.Printf(
+				"Starting from requested height: %d",
+				startHeight,
+			)
+		}
+
+	} else {
+
+		log.Printf(
+			"No manual start height provided",
+		)
+
+		log.Printf(
+			"Continuing from latest indexed height: %d",
+			startHeight,
+		)
 	}
 
 	log.Printf(
-		"Starting ingestion from height %d...",
+		"Final ingestion start height: %d",
 		startHeight,
 	)
 
