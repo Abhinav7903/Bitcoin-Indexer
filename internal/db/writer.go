@@ -74,20 +74,21 @@ func (w *Writer) SaveBlockBatch(
 		return err
 	}
 
-	// -----------------------------------
-	// Historical sync optimizations
-	// -----------------------------------
+
+
+	if spentInputsReady {
+		if err := applySpendState(ctx, tx); err != nil {
+			return err
+		}
+	}
 
 	if !w.historicalSync {
 
 		if spentInputsReady {
-			if err := applySpendState(ctx, tx); err != nil {
-				return err
-			}
-		}
-
-		if spentInputsReady {
-			if err := copySenderAddressTransactions(ctx, tx); err != nil {
+			if err := copySenderAddressTransactions(
+				ctx,
+				tx,
+			); err != nil {
 				return err
 			}
 		}
@@ -99,16 +100,6 @@ func (w *Writer) SaveBlockBatch(
 				addrTxs,
 				spentInputsReady,
 			); err != nil {
-				return err
-			}
-		}
-	} else {
-
-		// historical sync mode:
-		// only maintain live utxo_set
-
-		if spentInputsReady {
-			if err := deleteSpentUTXOs(ctx, tx); err != nil {
 				return err
 			}
 		}
