@@ -18,6 +18,10 @@ import (
 
 func main() {
 
+	// --------------------------------------------------
+	// Graceful shutdown context
+	// --------------------------------------------------
+
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -72,7 +76,7 @@ func main() {
 	)
 
 	// --------------------------------------------------
-	// PostgreSQL pool
+	// PostgreSQL connection pool
 	// --------------------------------------------------
 
 	dbConfig, err := pgxpool.ParseConfig(
@@ -111,19 +115,21 @@ func main() {
 	// DB writer
 	// --------------------------------------------------
 
+	// historicalSync=true:
+	// optimize for fast initial indexing
 	dbWriter := db.NewWriter(
 		pool,
-		true, // historical sync mode
+		true,
 	)
 
 	// --------------------------------------------------
-	// Get latest indexed height
+	// Determine latest indexed height
 	// --------------------------------------------------
 
 	lastHeight, err := dbWriter.GetLastHeight(ctx)
 	if err != nil {
 		log.Fatalf(
-			"Failed to get last height: %v",
+			"Failed to get last indexed height: %v",
 			err,
 		)
 	}
@@ -134,12 +140,12 @@ func main() {
 	)
 
 	// --------------------------------------------------
-	// Determine start height
+	// Compute start height
 	// --------------------------------------------------
 
 	var startHeight int32
 
-	// Empty DB -> start from genesis
+	// Empty DB -> genesis
 	if lastHeight == 0 {
 
 		var genesisExists bool
@@ -164,22 +170,22 @@ func main() {
 
 	} else {
 
-		// Continue from next block
+		// continue from next block
 		startHeight = lastHeight + 1
 	}
 
 	// --------------------------------------------------
-	// Manual override logic
+	// Manual override
 	// --------------------------------------------------
 
-	if cfg.StartHeight >= 0 {
+	if cfg.StartHeight > 0 {
 
 		log.Printf(
 			"Manual start height requested: %d",
 			cfg.StartHeight,
 		)
 
-		// If already indexed
+		// already indexed
 		if cfg.StartHeight <= lastHeight {
 
 			log.Printf(
@@ -223,7 +229,7 @@ func main() {
 	)
 
 	// --------------------------------------------------
-	// Pipeline
+	// Build ingestion pipeline
 	// --------------------------------------------------
 
 	p := pipeline.NewPipeline(
@@ -240,7 +246,7 @@ func main() {
 	)
 
 	// --------------------------------------------------
-	// Run
+	// Run pipeline
 	// --------------------------------------------------
 
 	if err := p.Run(ctx, startHeight); err != nil {
