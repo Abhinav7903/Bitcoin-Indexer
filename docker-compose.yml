@@ -1,0 +1,14 @@
+services:
+  db:
+    image: apache/age:PG16_latest
+    environment:
+      POSTGRES_USER: hornet
+      POSTGRES_PASSWORD: H0rnSt@r
+      POSTGRES_DB: btc_indexer
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
