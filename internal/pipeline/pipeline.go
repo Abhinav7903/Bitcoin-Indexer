@@ -42,33 +42,101 @@ func NewPipeline(rpcClient *rpc.Client, dbWriter *db.Writer, workers, batchSize 
 	}
 	return &Pipeline{rpcClient: rpcClient, dbWriter: dbWriter, workers: workers, batchSize: batchSize}
 }
-
 func (p *Pipeline) Run(ctx context.Context, startHeight int32) error {
+
+	const safeConfirmations int32 = 10
+
 	for {
-		tip, err := p.rpcClient.GetBlockCount()
+
+		// ----------------------------------------
+		// Fetch blockchain sync state
+		// ----------------------------------------
+
+		info, err := p.rpcClient.GetBlockchainInfo()
 		if err != nil {
 			return err
 		}
 
-		if startHeight > tip {
-			log.Printf("Waiting for new blocks (current tip: %d)...", tip)
+		blocks := int32(info.Blocks)
+		headers := int32(info.Headers)
+
+		// ----------------------------------------
+		// Safe indexing tip
+		// ----------------------------------------
+
+		safeTip := blocks - safeConfirmations
+
+		if safeTip < 0 {
+			safeTip = 0
+		}
+
+		// ----------------------------------------
+		// Node still syncing
+		// ----------------------------------------
+
+		if blocks < headers {
+
+			log.Printf(
+				"Bitcoin node syncing | blocks=%d headers=%d remaining=%d",
+				blocks,
+				headers,
+				headers-blocks,
+			)
+		}
+
+		// ----------------------------------------
+		// Indexer caught up
+		// ----------------------------------------
+
+		if startHeight > safeTip {
+
+			log.Printf(
+				"Indexer caught up | start=%d safe_tip=%d waiting for more blocks...",
+				startHeight,
+				safeTip,
+			)
+
 			select {
+
 			case <-ctx.Done():
 				return ctx.Err()
+
 			case <-time.After(10 * time.Second):
 				continue
 			}
 		}
 
+		// ----------------------------------------
+		// Batch range
+		// ----------------------------------------
+
 		endHeight := startHeight + int32(p.batchSize) - 1
-		if endHeight > tip {
-			endHeight = tip
+
+		if endHeight > safeTip {
+			endHeight = safeTip
 		}
 
-		log.Printf("Ingesting blocks %d to %d...", startHeight, endHeight)
-		if err := p.ingestRange(ctx, startHeight, endHeight); err != nil {
+		log.Printf(
+			"Ingesting blocks %d -> %d | safe_tip=%d blocks=%d headers=%d",
+			startHeight,
+			endHeight,
+			safeTip,
+			blocks,
+			headers,
+		)
+
+		// ----------------------------------------
+		// Ingest batch
+		// ----------------------------------------
+
+		if err := p.ingestRange(
+			ctx,
+			startHeight,
+			endHeight,
+		); err != nil {
 			return err
 		}
+
 		startHeight = endHeight + 1
 	}
 }
@@ -155,7 +223,7 @@ func (p *Pipeline) ingestRange(ctx context.Context, start, end int32) error {
 	dbDuration := time.Since(dbStartTime)
 
 	if err == nil {
-		log.Printf("Batch %d-%d: Fetched %d blocks (%d txs) in %v, DB write in %v", 
+		log.Printf("Batch %d-%d: Fetched %d blocks (%d txs) in %v, DB write in %v",
 			start, end, count, totalTxs, fetchDuration, dbDuration)
 	}
 

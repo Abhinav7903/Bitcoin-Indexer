@@ -187,3 +187,25 @@ func (c *Client) GetBlockVerbose(hash string) (map[string]interface{}, error) {
 
 	return response.Result, nil
 }
+
+type BlockchainInfo struct {
+	Blocks  int64 `json:"blocks"`
+	Headers int64 `json:"headers"`
+}
+
+func (c *Client) GetBlockchainInfo() (*BlockchainInfo, error) {
+
+	var result BlockchainInfo
+
+	err := c.call(
+		"getblockchaininfo",
+		[]interface{}{},
+		&result,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
