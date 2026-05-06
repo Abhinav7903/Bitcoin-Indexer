@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 
 	"github.com/Abhinav7903/bitcoin-indexer/internal/models"
 	"github.com/jackc/pgx/v5"
@@ -317,6 +318,7 @@ func (w *Writer) GetLastHeight(ctx context.Context) (int32, error) {
 		return height, nil
 	}
 	err = w.pool.QueryRow(ctx, "SELECT COALESCE(MAX(height), 0) FROM blocks").Scan(&height)
+	slog.Info("Last height", "height", height)
 	return height, err
 }
 

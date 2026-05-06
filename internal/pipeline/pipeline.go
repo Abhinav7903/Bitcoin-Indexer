@@ -75,6 +75,7 @@ func (p *Pipeline) Run(ctx context.Context, startHeight int32) error {
 
 func (p *Pipeline) ingestRange(ctx context.Context, start, end int32) error {
 	count := int(end - start + 1)
+	startTime := time.Now()
 
 	resChan := make(chan blockResult, count)
 	heightChan := make(chan int32, count)
@@ -120,6 +121,8 @@ func (p *Pipeline) ingestRange(ctx context.Context, start, end int32) error {
 		return firstErr
 	}
 
+	fetchDuration := time.Since(startTime)
+
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].block.Height < results[j].block.Height
 	})
@@ -130,15 +133,18 @@ func (p *Pipeline) ingestRange(ctx context.Context, start, end int32) error {
 	var addrTxs []models.AddressTransaction
 	var inputs []models.Input
 
+	totalTxs := 0
 	for _, res := range results {
 		blocks = append(blocks, res.block)
 		txs = append(txs, res.txs...)
 		outputs = append(outputs, res.outputs...)
 		addrTxs = append(addrTxs, res.addrTxs...)
 		inputs = append(inputs, res.inputs...)
+		totalTxs += len(res.txs)
 	}
 
-	return p.dbWriter.SaveBlockBatch(
+	dbStartTime := time.Now()
+	err := p.dbWriter.SaveBlockBatch(
 		ctx,
 		blocks,
 		txs,
@@ -146,9 +152,18 @@ func (p *Pipeline) ingestRange(ctx context.Context, start, end int32) error {
 		addrTxs,
 		inputs,
 	)
+	dbDuration := time.Since(dbStartTime)
+
+	if err == nil {
+		log.Printf("Batch %d-%d: Fetched %d blocks (%d txs) in %v, DB write in %v", 
+			start, end, count, totalTxs, fetchDuration, dbDuration)
+	}
+
+	return err
 }
 
 func (p *Pipeline) fetchBlock(height int32) blockResult {
+	rpcStart := time.Now()
 	hash, err := p.rpcClient.GetBlockHash(height)
 	if err != nil {
 		return blockResult{err: err}
@@ -157,7 +172,20 @@ func (p *Pipeline) fetchBlock(height int32) blockResult {
 	if err != nil {
 		return blockResult{err: err}
 	}
-	return parseBlock(height, rawBlock)
+	rpcDuration := time.Since(rpcStart)
+
+	parseStart := time.Now()
+	res := parseBlock(height, rawBlock)
+	parseDuration := time.Since(parseStart)
+
+	if res.err == nil {
+		// Only log if it's taking significant time, or if you want to see every block
+		if rpcDuration > 500*time.Millisecond || parseDuration > 100*time.Millisecond {
+			log.Printf("Block %d: RPC %v, Parse %v (%d txs)", height, rpcDuration, parseDuration, len(res.txs))
+		}
+	}
+
+	return res
 }
 
 func parseBlock(height int32, rawBlock map[string]interface{}) blockResult {

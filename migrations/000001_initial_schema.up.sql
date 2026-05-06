@@ -253,6 +253,8 @@ ON CONFLICT (id) DO NOTHING;
 -- ============================================================
 -- Apache AGE graph (optional — comment out if not using AGE)
 -- ============================================================
+SET search_path = ag_catalog, "$user", public;
+
 SELECT create_graph('bitcoin');
 
 SELECT create_vlabel('bitcoin', 'block');
