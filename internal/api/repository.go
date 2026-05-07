@@ -31,7 +31,7 @@ func (r *Repository) GetAddressInfo(ctx context.Context, address string) (*Addre
 		&info.TxCount, &info.UtxoCount, &info.FirstSeenHeight, &info.LastSeenHeight,
 	)
 	if err == nil {
-		if err := r.setAddressTxCount(ctx, address, &info); err != nil {
+		if err := r.setAddressStats(ctx, address, &info); err != nil {
 			return nil, err
 		}
 		return &info, nil
@@ -103,12 +103,9 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 			       MAX(tx_index) AS tx_index,
 			       MAX(block_time) AS block_time,
 			       SUM(net_value_sats) AS net_value_sats,
-			       CASE
-			           WHEN COUNT(DISTINCT role) > 1 THEN 2::SMALLINT
-			           ELSE MIN(role)
-			       END AS role
+			       role
 			FROM filtered
-			GROUP BY txid, block_height
+			GROUP BY txid, block_height, role
 		)
 		SELECT txid, block_height, block_time, net_value_sats, role
 		FROM aggregated
@@ -174,12 +171,9 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 			SELECT txid,
 			       block_height,
 			       SUM(net_value) AS net_value_sats,
-			       CASE
-			           WHEN COUNT(DISTINCT role) > 1 THEN 2::SMALLINT
-			           ELSE MIN(role)
-			       END AS role
+			       role
 			FROM filtered
-			GROUP BY txid, block_height
+			GROUP BY txid, block_height, role
 		)
 		SELECT a.txid, a.block_height, b.block_time, a.net_value_sats, a.role
 		FROM aggregated a
@@ -223,39 +217,46 @@ func normalizeDirection(direction string) string {
 	}
 }
 
-func (r *Repository) setAddressTxCount(ctx context.Context, address string, info *AddressInfo) error {
-	count, err := r.countAddressTransactions(ctx, address)
-	if err != nil {
-		return err
-	}
-	if count > 0 {
-		info.TxCount = count
-	}
-	return nil
-}
-
-func (r *Repository) countAddressTransactions(ctx context.Context, address string) (int, error) {
-	var count int
+func (r *Repository) setAddressStats(ctx context.Context, address string, info *AddressInfo) error {
+	var stats AddressInfo
 	err := r.pool.QueryRow(ctx, `
 		WITH txs AS (
-			SELECT txid
-			FROM address_transactions
-			WHERE address = $1
-			UNION
-			SELECT txid
+			SELECT txid, block_height, value_sats AS received, 0::BIGINT AS sent
 			FROM tx_outputs
 			WHERE address = $1
-			UNION
-			SELECT spending_txid
+			UNION ALL
+			SELECT spending_txid, spent_height, 0::BIGINT AS received, value_sats AS sent
 			FROM tx_outputs
 			WHERE address = $1
 			  AND is_spent = TRUE
 			  AND spending_txid IS NOT NULL
 		)
-		SELECT COUNT(*)
+		SELECT COUNT(DISTINCT txid)::INT,
+		       COALESCE(MIN(block_height), 0)::INT,
+		       COALESCE(MAX(block_height), 0)::INT,
+		       COALESCE(SUM(received), 0)::BIGINT,
+		       COALESCE(SUM(sent), 0)::BIGINT
 		FROM txs
-	`, address).Scan(&count)
-	return count, err
+	`, address).Scan(
+		&stats.TxCount,
+		&stats.FirstSeenHeight,
+		&stats.LastSeenHeight,
+		&stats.TotalReceivedSats,
+		&stats.TotalSentSats,
+	)
+	if err != nil {
+		return err
+	}
+	if stats.TxCount == 0 {
+		return nil
+	}
+
+	info.TxCount = stats.TxCount
+	info.FirstSeenHeight = stats.FirstSeenHeight
+	info.LastSeenHeight = stats.LastSeenHeight
+	info.TotalReceivedSats = stats.TotalReceivedSats
+	info.TotalSentSats = stats.TotalSentSats
+	return nil
 }
 
 func (r *Repository) GetTransaction(ctx context.Context, txidHex string) (*TxInfo, error) {
