@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"time"
@@ -227,11 +226,6 @@ func (c *Client) GetBlockchainInfo() (*BlockchainInfo, error) {
 			response.Error,
 		)
 	}
-
-	log.Printf(
-		"BlockchainInfo: %+v",
-		response.Result,
-	)
 
 	return &response.Result, nil
 }
