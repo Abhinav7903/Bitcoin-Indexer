@@ -115,15 +115,11 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 	}
 	rows.Close()
 
-	if len(txs) > 0 || direction != "" {
-		// If we found transactions or if a specific direction was requested (meaning we should stick to the filter), return
-		// However, if we found nothing, we should still try the fallback but with the same filter.
-		if len(txs) > 0 {
-			return txs, nil
-		}
+	if len(txs) > 0 && direction == "" {
+		return txs, nil
 	}
 
-	// Fallback for historical sync: Query tx_outputs joined with transactions for ordering
+	// Fallback for historical sync: Query tx_outputs joined with blocks for ordering
 	fallbackQuery := fmt.Sprintf(`
 		WITH combined AS (
 			SELECT txid, block_height, value_sats as net_value, 0 as role
@@ -144,9 +140,8 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 		SELECT a.txid, a.block_height, b.block_time, a.net_value_sats, a.role
 		FROM aggregated a
 		LEFT JOIN blocks b ON b.height = a.block_height
-		LEFT JOIN transactions t ON t.txid = a.txid AND t.block_height = a.block_height
 		WHERE 1=1 %s
-		ORDER BY a.block_height DESC, COALESCE(t.tx_index, 0) DESC
+		ORDER BY a.block_height DESC
 		LIMIT $2 OFFSET $3
 	`, roleFilter)
 
