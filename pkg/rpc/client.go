@@ -189,8 +189,17 @@ func (c *Client) GetBlockVerbose(hash string) (map[string]interface{}, error) {
 }
 
 type BlockchainInfo struct {
-	Blocks  int64 `json:"blocks"`
-	Headers int64 `json:"headers"`
+	Chain                string  `json:"chain"`
+	Blocks               int64   `json:"blocks"`
+	Headers              int64   `json:"headers"`
+	BestBlockHash        string  `json:"bestblockhash"`
+	Difficulty           float64 `json:"difficulty"`
+	MedianTime           int64   `json:"mediantime"`
+	VerificationProgress float64 `json:"verificationprogress"`
+	InitialBlockDownload bool    `json:"initialblockdownload"`
+	ChainWork            string  `json:"chainwork"`
+	SizeOnDisk           int64   `json:"size_on_disk"`
+	Pruned               bool    `json:"pruned"`
 }
 
 func (c *Client) GetBlockchainInfo() (*BlockchainInfo, error) {

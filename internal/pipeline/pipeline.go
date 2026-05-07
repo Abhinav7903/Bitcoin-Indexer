@@ -42,9 +42,8 @@ func NewPipeline(rpcClient *rpc.Client, dbWriter *db.Writer, workers, batchSize 
 	}
 	return &Pipeline{rpcClient: rpcClient, dbWriter: dbWriter, workers: workers, batchSize: batchSize}
 }
-func (p *Pipeline) Run(ctx context.Context, startHeight int32) error {
 
-	const safeConfirmations int32 = 10
+func (p *Pipeline) Run(ctx context.Context, startHeight int32) error {
 
 	for {
 
@@ -60,14 +59,24 @@ func (p *Pipeline) Run(ctx context.Context, startHeight int32) error {
 		blocks := int32(info.Blocks)
 		headers := int32(info.Headers)
 
-		// ----------------------------------------
-		// Safe indexing tip
-		// ----------------------------------------
+	
+		var safeTip int32
 
-		safeTip := blocks - safeConfirmations
+		if info.InitialBlockDownload {
 
-		if safeTip < 0 {
-			safeTip = 0
+			// historical sync mode
+			safeTip = blocks
+
+		} else {
+
+			// live chain safety lag
+			const safeConfirmations int32 = 10
+
+			safeTip = blocks - safeConfirmations
+
+			if safeTip < 0 {
+				safeTip = 0
+			}
 		}
 
 		// ----------------------------------------
@@ -257,20 +266,45 @@ func (p *Pipeline) fetchBlock(height int32) blockResult {
 }
 
 func parseBlock(height int32, rawBlock map[string]interface{}) blockResult {
+
 	blockHash, err := hexString(rawBlock, "hash")
 	if err != nil {
 		return blockResult{err: err}
 	}
-	blockTime := time.Unix(int64(number(rawBlock["time"])), 0)
+
+	blockTime := time.Unix(
+		int64(number(rawBlock["time"])),
+		0,
+	)
+
 	txList, ok := rawBlock["tx"].([]interface{})
 	if !ok {
-		return blockResult{err: fmt.Errorf("block %d has invalid tx list", height)}
+		return blockResult{
+			err: fmt.Errorf(
+				"block %d has invalid tx list",
+				height,
+			),
+		}
+	}
+
+	// ----------------------------------------
+	// Genesis block fix
+	// ----------------------------------------
+
+	prevHash := optionalHex(
+		rawBlock["previousblockhash"],
+	)
+
+	// Genesis block has no previous hash.
+	// Store 32-byte zero hash instead of NULL.
+	if height == 0 && len(prevHash) == 0 {
+		prevHash = make([]byte, 32)
 	}
 
 	block := models.Block{
 		Hash:          blockHash,
 		Height:        height,
-		PreviousHash:  optionalHex(rawBlock["previousblockhash"]),
+		PreviousHash:  prevHash,
 		MerkleRoot:    optionalHex(rawBlock["merkleroot"]),
 		Time:          blockTime,
 		Bits:          bitsToInt(rawBlock["bits"]),
@@ -288,10 +322,18 @@ func parseBlock(height int32, rawBlock map[string]interface{}) blockResult {
 	var blockInputs []models.Input
 
 	for txIndex, item := range txList {
+
 		rawTx, ok := item.(map[string]interface{})
 		if !ok {
-			return blockResult{err: fmt.Errorf("block %d tx %d has invalid shape", height, txIndex)}
+			return blockResult{
+				err: fmt.Errorf(
+					"block %d tx %d has invalid shape",
+					height,
+					txIndex,
+				),
+			}
 		}
+
 		txid, err := hexString(rawTx, "txid")
 		if err != nil {
 			return blockResult{err: err}
@@ -299,61 +341,129 @@ func parseBlock(height int32, rawBlock map[string]interface{}) blockResult {
 
 		vins := list(rawTx["vin"])
 		vouts := list(rawTx["vout"])
-		isCoinbase := len(vins) > 0 && hasKey(vins[0], "coinbase")
+
+		isCoinbase := len(vins) > 0 &&
+			hasKey(vins[0], "coinbase")
+
 		fee := optionalSats(rawTx["fee"])
+
 		if fee != nil {
 			block.TotalFeesSats += *fee
 		}
 
-		blockTxs = append(blockTxs, models.Transaction{
-			Txid:        txid,
-			BlockHash:   blockHash,
-			BlockHeight: height,
-			TxIndex:     int32(txIndex),
-			Version:     int32(number(rawTx["version"])),
-			Locktime:    int64(number(rawTx["locktime"])),
-			IsCoinbase:  isCoinbase,
-			InputCount:  int16(len(vins)),
-			OutputCount: int16(len(vouts)),
-			FeeSats:     fee,
-			SizeBytes:   int32(number(rawTx["size"])),
-			VSize:       int32(number(rawTx["vsize"])),
-			Weight:      int32(number(rawTx["weight"])),
-			HasSegwit:   txHasWitness(vins),
-		})
+		blockTxs = append(
+			blockTxs,
+			models.Transaction{
+				Txid:        txid,
+				BlockHash:   blockHash,
+				BlockHeight: height,
+				TxIndex:     int32(txIndex),
+				Version:     int32(number(rawTx["version"])),
+				Locktime:    int64(number(rawTx["locktime"])),
+				IsCoinbase:  isCoinbase,
+				InputCount:  int16(len(vins)),
+				OutputCount: int16(len(vouts)),
+				FeeSats:     fee,
+				SizeBytes:   int32(number(rawTx["size"])),
+				VSize:       int32(number(rawTx["vsize"])),
+				Weight:      int32(number(rawTx["weight"])),
+				HasSegwit:   txHasWitness(vins),
+			},
+		)
+
+		// ----------------------------------------
+		// Inputs
+		// ----------------------------------------
 
 		for vinIndex, item := range vins {
+
 			vin := asMap(item)
+
 			input := models.Input{
 				Txid:        txid,
 				VinIdx:      int32(vinIndex),
 				BlockHeight: height,
 				ScriptSig:   scriptSig(vin),
 				WitnessData: witness(vin),
-				SequenceNo:  int64(numberDefault(vin["sequence"], 4294967294)),
+				SequenceNo: int64(
+					numberDefault(
+						vin["sequence"],
+						4294967294,
+					),
+				),
 			}
+
 			if !hasKey(item, "coinbase") {
-				input.PrevTxid = optionalHex(vin["txid"])
-				prevVout := int32(number(vin["vout"]))
+
+				input.PrevTxid = optionalHex(
+					vin["txid"],
+				)
+
+				prevVout := int32(
+					number(vin["vout"]),
+				)
+
 				input.PrevVout = &prevVout
 			}
-			blockInputs = append(blockInputs, input)
+
+			blockInputs = append(
+				blockInputs,
+				input,
+			)
 		}
 
+		// ----------------------------------------
+		// Outputs
+		// ----------------------------------------
+
 		for _, item := range vouts {
+
 			vout := asMap(item)
 			spk := asMap(vout["scriptPubKey"])
+
 			addr := scriptAddress(spk)
 			value := sats(vout["value"])
-			output := models.Output{Txid: txid, VoutIdx: int32(number(vout["n"])), Address: addr, ValueSats: value, BlockHeight: height, ScriptPubKey: optionalHex(spk["hex"]), ScriptType: scriptType(spk)}
-			blockOutputs = append(blockOutputs, output)
+
+			output := models.Output{
+				Txid:         txid,
+				VoutIdx:      int32(number(vout["n"])),
+				Address:      addr,
+				ValueSats:    value,
+				BlockHeight:  height,
+				ScriptPubKey: optionalHex(spk["hex"]),
+				ScriptType:   scriptType(spk),
+			}
+
+			blockOutputs = append(
+				blockOutputs,
+				output,
+			)
+
 			if addr != "" {
-				blockAddrTxs = append(blockAddrTxs, models.AddressTransaction{Address: addr, Txid: txid, BlockHeight: height, TxIndex: int32(txIndex), Role: models.RoleReceiver, NetValueSats: value, BlockTime: blockTime})
+
+				blockAddrTxs = append(
+					blockAddrTxs,
+					models.AddressTransaction{
+						Address:      addr,
+						Txid:         txid,
+						BlockHeight:  height,
+						TxIndex:      int32(txIndex),
+						Role:         models.RoleReceiver,
+						NetValueSats: value,
+						BlockTime:    blockTime,
+					},
+				)
 			}
 		}
 	}
 
-	return blockResult{block: block, txs: blockTxs, outputs: blockOutputs, addrTxs: blockAddrTxs, inputs: blockInputs}
+	return blockResult{
+		block:   block,
+		txs:     blockTxs,
+		outputs: blockOutputs,
+		addrTxs: blockAddrTxs,
+		inputs:  blockInputs,
+	}
 }
 
 func hexString(m map[string]interface{}, key string) ([]byte, error) {
