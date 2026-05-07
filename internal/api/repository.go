@@ -31,6 +31,9 @@ func (r *Repository) GetAddressInfo(ctx context.Context, address string) (*Addre
 		&info.TxCount, &info.UtxoCount, &info.FirstSeenHeight, &info.LastSeenHeight,
 	)
 	if err == nil {
+		if err := r.setAddressTxCount(ctx, address, &info); err != nil {
+			return nil, err
+		}
 		return &info, nil
 	}
 
@@ -54,12 +57,12 @@ func (r *Repository) GetAddressInfo(ctx context.Context, address string) (*Addre
 			SELECT txid, block_height, value_sats as received, 0 as sent
 			FROM tx_outputs
 			WHERE address = $1
-			UNION ALL
+			UNION
 			SELECT spending_txid, spent_height, 0 as received, value_sats as sent
 			FROM tx_outputs
-			WHERE address = $1 AND is_spent = TRUE
+			WHERE address = $1 AND is_spent = TRUE AND spending_txid IS NOT NULL
 		)
-		SELECT COUNT(*), 
+		SELECT COUNT(DISTINCT txid),
 		       COALESCE(MIN(block_height), 0), 
 		       COALESCE(MAX(block_height), 0),
 		       COALESCE(SUM(received), 0),
@@ -77,8 +80,9 @@ func (r *Repository) GetAddressInfo(ctx context.Context, address string) (*Addre
 }
 
 func (r *Repository) GetAddressTransactions(ctx context.Context, address string, direction string, limit, offset int) ([]AddressTransaction, error) {
+	direction = normalizeDirection(direction)
 	roleFilter := ""
-	switch strings.ToLower(direction) {
+	switch direction {
 	case "in": // Sender in user's convention
 		roleFilter = "AND role = 1"
 	case "out": // Receiver in user's convention
@@ -102,7 +106,7 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 	defer rows.Close()
 
 	var txs []AddressTransaction
-	hasIn := false
+	hasSender := false
 	for rows.Next() {
 		var tx AddressTransaction
 		var txid []byte
@@ -115,21 +119,24 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 		tx.Role = formatRole(role)
 		tx.Direction = formatDirection(role)
 		if role == 1 || role == 2 {
-			hasIn = true
+			hasSender = true
 		}
 		txs = append(txs, tx)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	// Optimization: If we found results and they satisfy the direction request, return them.
 	// 'out' rows are always present in address_transactions.
 	// 'in' rows are only present if backfilled.
 	if len(txs) > 0 {
-		if direction == "out" || hasIn {
+		if direction == "out" || hasSender {
 			return txs, nil
 		}
 	}
 
-	// Fallback for historical sync or missing backfill: 
+	// Fallback for historical sync or missing backfill:
 	// Query tx_outputs directly (slower but complete for IN/BOTH roles).
 	fallbackQuery := fmt.Sprintf(`
 		WITH combined AS (
@@ -161,6 +168,7 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 	}
 	defer rows.Close()
 
+	txs = txs[:0]
 	for rows.Next() {
 		var tx AddressTransaction
 		var txid []byte
@@ -174,7 +182,54 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 		tx.Direction = formatDirection(int16(role))
 		txs = append(txs, tx)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return txs, nil
+}
+
+func normalizeDirection(direction string) string {
+	switch strings.ToLower(direction) {
+	case "in", "out", "both":
+		return strings.ToLower(direction)
+	default:
+		return "both"
+	}
+}
+
+func (r *Repository) setAddressTxCount(ctx context.Context, address string, info *AddressInfo) error {
+	count, err := r.countAddressTransactions(ctx, address)
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		info.TxCount = count
+	}
+	return nil
+}
+
+func (r *Repository) countAddressTransactions(ctx context.Context, address string) (int, error) {
+	var count int
+	err := r.pool.QueryRow(ctx, `
+		WITH txs AS (
+			SELECT txid
+			FROM address_transactions
+			WHERE address = $1
+			UNION
+			SELECT txid
+			FROM tx_outputs
+			WHERE address = $1
+			UNION
+			SELECT spending_txid
+			FROM tx_outputs
+			WHERE address = $1
+			  AND is_spent = TRUE
+			  AND spending_txid IS NOT NULL
+		)
+		SELECT COUNT(*)
+		FROM txs
+	`, address).Scan(&count)
+	return count, err
 }
 
 func (r *Repository) GetTransaction(ctx context.Context, txidHex string) (*TxInfo, error) {
