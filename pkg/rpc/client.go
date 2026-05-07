@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"time"
@@ -194,6 +195,7 @@ type BlockchainInfo struct {
 	Headers              int64   `json:"headers"`
 	BestBlockHash        string  `json:"bestblockhash"`
 	Difficulty           float64 `json:"difficulty"`
+	Time                 int64   `json:"time"`
 	MedianTime           int64   `json:"mediantime"`
 	VerificationProgress float64 `json:"verificationprogress"`
 	InitialBlockDownload bool    `json:"initialblockdownload"`
@@ -215,6 +217,8 @@ func (c *Client) GetBlockchainInfo() (*BlockchainInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	log.Printf("BlockchainInfo: %+v", result)
 
 	return &result, nil
 }

@@ -56,10 +56,16 @@ func (p *Pipeline) Run(ctx context.Context, startHeight int32) error {
 			return err
 		}
 
+		log.Printf(
+			"RPC blockchain info | blocks=%d headers=%d ibd=%v",
+			info.Blocks,
+			info.Headers,
+			info.InitialBlockDownload,
+		)
+
 		blocks := int32(info.Blocks)
 		headers := int32(info.Headers)
 
-	
 		var safeTip int32
 
 		if info.InitialBlockDownload {
