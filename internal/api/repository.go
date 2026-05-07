@@ -59,13 +59,12 @@ func (r *Repository) GetAddressInfo(ctx context.Context, address string) (*Addre
 			FROM tx_outputs
 			WHERE address = $1 AND is_spent = TRUE
 		)
-		SELECT COUNT(DISTINCT txid), 
+		SELECT COUNT(*), 
 		       COALESCE(MIN(block_height), 0), 
 		       COALESCE(MAX(block_height), 0),
 		       COALESCE(SUM(received), 0),
 		       COALESCE(SUM(sent), 0)
 		FROM txs
-		WHERE txid IS NOT NULL
 	`, address).Scan(&info.TxCount, &info.FirstSeenHeight, &info.LastSeenHeight, &info.TotalReceivedSats, &info.TotalSentSats)
 	if err != nil {
 		return nil, err
@@ -79,11 +78,13 @@ func (r *Repository) GetAddressInfo(ctx context.Context, address string) (*Addre
 
 func (r *Repository) GetAddressTransactions(ctx context.Context, address string, direction string, limit, offset int) ([]AddressTransaction, error) {
 	roleFilter := ""
-	switch direction {
+	switch strings.ToLower(direction) {
 	case "in": // Sender in user's convention
 		roleFilter = "AND role = 1"
 	case "out": // Receiver in user's convention
 		roleFilter = "AND role = 0"
+	case "both":
+		roleFilter = "" // Selects both roles
 	}
 
 	query := fmt.Sprintf(`
@@ -101,6 +102,7 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 	defer rows.Close()
 
 	var txs []AddressTransaction
+	hasIn := false
 	for rows.Next() {
 		var tx AddressTransaction
 		var txid []byte
@@ -112,16 +114,23 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 		tx.Txid = hex.EncodeToString(txid)
 		tx.Role = formatRole(role)
 		tx.Direction = formatDirection(role)
+		if role == 1 || role == 2 {
+			hasIn = true
+		}
 		txs = append(txs, tx)
 	}
 
-	if len(txs) > 0 || direction != "" {
-		if len(txs) > 0 {
+	// Optimization: If we found results and they satisfy the direction request, return them.
+	// 'out' rows are always present in address_transactions.
+	// 'in' rows are only present if backfilled.
+	if len(txs) > 0 {
+		if direction == "out" || hasIn {
 			return txs, nil
 		}
 	}
 
-	// Fallback for historical sync: Query tx_outputs joined with blocks for ordering
+	// Fallback for historical sync or missing backfill: 
+	// Query tx_outputs directly (slower but complete for IN/BOTH roles).
 	fallbackQuery := fmt.Sprintf(`
 		WITH combined AS (
 			SELECT txid, block_height, value_sats as net_value, 0 as role
