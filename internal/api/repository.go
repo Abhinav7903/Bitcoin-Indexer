@@ -76,14 +76,24 @@ func (r *Repository) GetAddressInfo(ctx context.Context, address string) (*Addre
 	return &info, nil
 }
 
-func (r *Repository) GetAddressTransactions(ctx context.Context, address string, limit, offset int) ([]AddressTransaction, error) {
-	rows, err := r.pool.Query(ctx, `
+func (r *Repository) GetAddressTransactions(ctx context.Context, address string, direction string, limit, offset int) ([]AddressTransaction, error) {
+	roleFilter := ""
+	switch direction {
+	case "in":
+		roleFilter = "AND role IN (0, 2)"
+	case "out":
+		roleFilter = "AND role IN (1, 2)"
+	}
+
+	query := fmt.Sprintf(`
 		SELECT txid, block_height, block_time, net_value_sats, role
 		FROM address_transactions
-		WHERE address = $1
+		WHERE address = $1 %s
 		ORDER BY block_height DESC, tx_index DESC
 		LIMIT $2 OFFSET $3
-	`, address, limit, offset)
+	`, roleFilter)
+
+	rows, err := r.pool.Query(ctx, query, address, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -100,16 +110,21 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 		}
 		tx.Txid = hex.EncodeToString(txid)
 		tx.Role = formatRole(role)
+		tx.Direction = formatDirection(role)
 		txs = append(txs, tx)
 	}
 	rows.Close()
 
-	if len(txs) > 0 {
-		return txs, nil
+	if len(txs) > 0 || direction != "" {
+		// If we found transactions or if a specific direction was requested (meaning we should stick to the filter), return
+		// However, if we found nothing, we should still try the fallback but with the same filter.
+		if len(txs) > 0 {
+			return txs, nil
+		}
 	}
 
 	// Fallback for historical sync: Query tx_outputs joined with transactions for ordering
-	rows, err = r.pool.Query(ctx, `
+	fallbackQuery := fmt.Sprintf(`
 		WITH combined AS (
 			SELECT txid, block_height, value_sats as net_value, 0 as role
 			FROM tx_outputs
@@ -130,9 +145,12 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 		FROM aggregated a
 		JOIN blocks b ON b.height = a.block_height
 		JOIN transactions t ON t.txid = a.txid AND t.block_height = a.block_height
+		WHERE 1=1 %s
 		ORDER BY a.block_height DESC, t.tx_index DESC
 		LIMIT $2 OFFSET $3
-	`, address, limit, offset)
+	`, roleFilter)
+
+	rows, err = r.pool.Query(ctx, fallbackQuery, address, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -148,6 +166,7 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 		}
 		tx.Txid = hex.EncodeToString(txid)
 		tx.Role = formatRole(int16(role))
+		tx.Direction = formatDirection(int16(role))
 		txs = append(txs, tx)
 	}
 	return txs, nil
@@ -238,9 +257,13 @@ func (r *Repository) GetTransaction(ctx context.Context, txidHex string) (*TxInf
 		var scriptPubKey []byte
 		var scriptType int16
 		var spendingTxid []byte
-		err := outputRows.Scan(&out.Index, &out.ValueSats, &out.Address, &scriptPubKey, &scriptType, &out.Spent, &spendingTxid)
+		var addr *string
+		err := outputRows.Scan(&out.Index, &out.ValueSats, &addr, &scriptPubKey, &scriptType, &out.Spent, &spendingTxid)
 		if err != nil {
 			return nil, err
+		}
+		if addr != nil {
+			out.Address = *addr
 		}
 		if scriptPubKey != nil {
 			out.ScriptPubKey = hex.EncodeToString(scriptPubKey)
@@ -271,7 +294,7 @@ func (r *Repository) GetTrace(ctx context.Context, txidHex string) ([]string, er
 	}
 	defer rows.Close()
 
-	var descendants []string
+	descendants := []string{}
 	for rows.Next() {
 		var dTxid []byte
 		if err := rows.Scan(&dTxid); err != nil {
@@ -292,6 +315,19 @@ func formatRole(role int16) string {
 		return "both"
 	default:
 		return "unknown"
+	}
+}
+
+func formatDirection(role int16) string {
+	switch role {
+	case models.RoleReceiver:
+		return "IN"
+	case models.RoleSender:
+		return "OUT"
+	case models.RoleBoth:
+		return "BOTH"
+	default:
+		return "UNKNOWN"
 	}
 }
 

@@ -35,8 +35,12 @@ func (h *Handler) GetAddress(c *gin.Context) {
 
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "10"))
 	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
+	direction := c.Query("direction")
+	if direction == "" {
+		direction = c.Query("role") // fallback to 'role' if 'direction' is not provided
+	}
 
-	txs, err := h.repo.GetAddressTransactions(c.Request.Context(), address, limit, offset)
+	txs, err := h.repo.GetAddressTransactions(c.Request.Context(), address, direction, limit, offset)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

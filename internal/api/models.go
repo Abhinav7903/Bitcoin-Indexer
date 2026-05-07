@@ -18,7 +18,8 @@ type AddressTransaction struct {
 	BlockHeight  int32     `json:"block_height"`
 	BlockTime    time.Time `json:"block_time"`
 	NetValueSats int64     `json:"net_value_sats"`
-	Role         string    `json:"role"` // "sender", "receiver", "both"
+	Role         string    `json:"role"`      // "receiver", "sender", "both"
+	Direction    string    `json:"direction"` // "IN", "OUT", "BOTH"
 }
 
 type TxInfo struct {
