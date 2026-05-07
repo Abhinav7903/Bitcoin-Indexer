@@ -206,19 +206,32 @@ type BlockchainInfo struct {
 
 func (c *Client) GetBlockchainInfo() (*BlockchainInfo, error) {
 
-	var result BlockchainInfo
+	var response struct {
+		Result BlockchainInfo `json:"result"`
+		Error  interface{}    `json:"error"`
+	}
 
 	err := c.call(
 		"getblockchaininfo",
 		[]interface{}{},
-		&result,
+		&response,
 	)
 
 	if err != nil {
 		return nil, err
 	}
 
-	log.Printf("BlockchainInfo: %+v", result)
+	if response.Error != nil {
+		return nil, fmt.Errorf(
+			"rpc getblockchaininfo error: %v",
+			response.Error,
+		)
+	}
 
-	return &result, nil
+	log.Printf(
+		"BlockchainInfo: %+v",
+		response.Result,
+	)
+
+	return &response.Result, nil
 }
