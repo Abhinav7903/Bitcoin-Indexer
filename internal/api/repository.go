@@ -143,10 +143,10 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 		)
 		SELECT a.txid, a.block_height, b.block_time, a.net_value_sats, a.role
 		FROM aggregated a
-		JOIN blocks b ON b.height = a.block_height
-		JOIN transactions t ON t.txid = a.txid AND t.block_height = a.block_height
+		LEFT JOIN blocks b ON b.height = a.block_height
+		LEFT JOIN transactions t ON t.txid = a.txid AND t.block_height = a.block_height
 		WHERE 1=1 %s
-		ORDER BY a.block_height DESC, t.tx_index DESC
+		ORDER BY a.block_height DESC, COALESCE(t.tx_index, 0) DESC
 		LIMIT $2 OFFSET $3
 	`, roleFilter)
 
