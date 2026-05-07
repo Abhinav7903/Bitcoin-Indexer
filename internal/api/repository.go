@@ -92,10 +92,27 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 	}
 
 	query := fmt.Sprintf(`
+		WITH filtered AS (
+			SELECT txid, block_height, tx_index, block_time, net_value_sats, role
+			FROM address_transactions
+			WHERE address = $1 %s
+		),
+		aggregated AS (
+			SELECT txid,
+			       block_height,
+			       MAX(tx_index) AS tx_index,
+			       MAX(block_time) AS block_time,
+			       SUM(net_value_sats) AS net_value_sats,
+			       CASE
+			           WHEN COUNT(DISTINCT role) > 1 THEN 2::SMALLINT
+			           ELSE MIN(role)
+			       END AS role
+			FROM filtered
+			GROUP BY txid, block_height
+		)
 		SELECT txid, block_height, block_time, net_value_sats, role
-		FROM address_transactions
-		WHERE address = $1 %s
-		ORDER BY block_height DESC
+		FROM aggregated
+		ORDER BY block_height DESC, tx_index DESC
 		LIMIT $2 OFFSET $3
 	`, roleFilter)
 
@@ -148,19 +165,28 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 			FROM tx_outputs
 			WHERE address = $1 AND is_spent = TRUE
 		),
-		aggregated AS (
-			SELECT txid, block_height, SUM(net_value) as net_value_sats, role
+		filtered AS (
+			SELECT txid, block_height, net_value, role
 			FROM combined
-			WHERE txid IS NOT NULL
-			GROUP BY txid, block_height, role
+			WHERE txid IS NOT NULL %s
+		),
+		aggregated AS (
+			SELECT txid,
+			       block_height,
+			       SUM(net_value) AS net_value_sats,
+			       CASE
+			           WHEN COUNT(DISTINCT role) > 1 THEN 2::SMALLINT
+			           ELSE MIN(role)
+			       END AS role
+			FROM filtered
+			GROUP BY txid, block_height
 		)
 		SELECT a.txid, a.block_height, b.block_time, a.net_value_sats, a.role
 		FROM aggregated a
 		LEFT JOIN blocks b ON b.height = a.block_height
-		WHERE 1=1 %s
 		ORDER BY a.block_height DESC
 		LIMIT $2 OFFSET $3
-	`, strings.ReplaceAll(roleFilter, "role", "a.role"))
+	`, roleFilter)
 
 	rows, err = r.pool.Query(ctx, fallbackQuery, address, limit, offset)
 	if err != nil {
