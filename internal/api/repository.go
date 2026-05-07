@@ -29,11 +29,49 @@ func (r *Repository) GetAddressInfo(ctx context.Context, address string) (*Addre
 		&info.Address, &info.BalanceSats, &info.TotalReceivedSats, &info.TotalSentSats,
 		&info.TxCount, &info.UtxoCount, &info.FirstSeenHeight, &info.LastSeenHeight,
 	)
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			return nil, nil
-		}
+	if err == nil {
+		return &info, nil
+	}
+
+	if err != pgx.ErrNoRows {
 		return nil, err
+	}
+
+	// Fallback: Compute from utxo_set and tx_outputs if not in cache (historical sync mode)
+	info.Address = address
+	err = r.pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(value_sats), 0), COUNT(*)
+		FROM utxo_set
+		WHERE address = $1
+	`, address).Scan(&info.BalanceSats, &info.UtxoCount)
+	if err != nil {
+		return nil, err
+	}
+
+	err = r.pool.QueryRow(ctx, `
+		WITH txs AS (
+			SELECT txid, block_height, value_sats as received, 0 as sent
+			FROM tx_outputs
+			WHERE address = $1
+			UNION ALL
+			SELECT spending_txid, spent_height, 0 as received, value_sats as sent
+			FROM tx_outputs
+			WHERE address = $1 AND is_spent = TRUE
+		)
+		SELECT COUNT(DISTINCT txid), 
+		       COALESCE(MIN(block_height), 0), 
+		       COALESCE(MAX(block_height), 0),
+		       COALESCE(SUM(received), 0),
+		       COALESCE(SUM(sent), 0)
+		FROM txs
+		WHERE txid IS NOT NULL
+	`, address).Scan(&info.TxCount, &info.FirstSeenHeight, &info.LastSeenHeight, &info.TotalReceivedSats, &info.TotalSentSats)
+	if err != nil {
+		return nil, err
+	}
+
+	if info.TxCount == 0 && info.UtxoCount == 0 {
+		return nil, nil
 	}
 	return &info, nil
 }
@@ -49,7 +87,6 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
 	var txs []AddressTransaction
 	for rows.Next() {
@@ -58,10 +95,59 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 		var role int16
 		err := rows.Scan(&txid, &tx.BlockHeight, &tx.BlockTime, &tx.NetValueSats, &role)
 		if err != nil {
+			rows.Close()
 			return nil, err
 		}
 		tx.Txid = hex.EncodeToString(txid)
 		tx.Role = formatRole(role)
+		txs = append(txs, tx)
+	}
+	rows.Close()
+
+	if len(txs) > 0 {
+		return txs, nil
+	}
+
+	// Fallback for historical sync: Query tx_outputs joined with transactions for ordering
+	rows, err = r.pool.Query(ctx, `
+		WITH combined AS (
+			SELECT txid, block_height, value_sats as net_value, 0 as role
+			FROM tx_outputs
+			WHERE address = $1
+			UNION ALL
+			SELECT spending_txid, spent_height, -value_sats as net_value, 1 as role
+			FROM tx_outputs
+			WHERE address = $1 AND is_spent = TRUE
+		),
+		aggregated AS (
+			SELECT txid, block_height, SUM(net_value) as net_value_sats, 
+			       CASE WHEN COUNT(*) > 1 THEN 2 ELSE MAX(role) END as role
+			FROM combined
+			WHERE txid IS NOT NULL
+			GROUP BY txid, block_height
+		)
+		SELECT a.txid, a.block_height, b.block_time, a.net_value_sats, a.role
+		FROM aggregated a
+		JOIN blocks b ON b.height = a.block_height
+		JOIN transactions t ON t.txid = a.txid AND t.block_height = a.block_height
+		ORDER BY a.block_height DESC, t.tx_index DESC
+		LIMIT $2 OFFSET $3
+	`, address, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var tx AddressTransaction
+		var txid []byte
+		var role int
+		err := rows.Scan(&txid, &tx.BlockHeight, &tx.BlockTime, &tx.NetValueSats, &role)
+		if err != nil {
+			return nil, err
+		}
+		tx.Txid = hex.EncodeToString(txid)
+		tx.Role = formatRole(int16(role))
 		txs = append(txs, tx)
 	}
 	return txs, nil
