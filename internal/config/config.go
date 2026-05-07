@@ -13,12 +13,14 @@ type Config struct {
 	Workers     int    `yaml:"workers"`
 	BatchSize   int    `yaml:"batch_size"`
 	StartHeight int32  `yaml:"start_height"`
+	Port        int    `yaml:"port"`
 }
 
 func Load(path string) (*Config, error) {
 	cfg := &Config{
 		Workers:   10,
 		BatchSize: 100,
+		Port:      8080,
 	}
 
 	// Try to load from YAML if it exists
@@ -52,6 +54,11 @@ func Load(path string) (*Config, error) {
 	if env := os.Getenv("START_HEIGHT"); env != "" {
 		if val, err := strconv.Atoi(env); err == nil {
 			cfg.StartHeight = int32(val)
+		}
+	}
+	if env := os.Getenv("PORT"); env != "" {
+		if val, err := strconv.Atoi(env); err == nil {
+			cfg.Port = val
 		}
 	}
 
