@@ -1,0 +1,7 @@
+# Backfill Configuration
+database_url: "postgres://postgres:postgres@localhost:5432/bitcoin_indexer?sslmode=disable"
+batch_size: 5000
+start_height: 0
+end_height: -1 # -1 means current tip
+skip_txs: false
+skip_balances: false

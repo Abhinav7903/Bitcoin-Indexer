@@ -38,6 +38,10 @@ func (w *Writer) SaveBlockBatch(
 
 	addrTxs = aggregateAddressTransactions(addrTxs)
 
+	if err := w.ensurePartitions(ctx, blocks); err != nil {
+		return fmt.Errorf("ensure partitions: %w", err)
+	}
+
 	tx, err := w.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -753,6 +757,76 @@ DO UPDATE SET
 
 	if err != nil {
 		return fmt.Errorf("update index_state: %w", err)
+	}
+
+	return nil
+}
+
+func (w *Writer) ensurePartitions(ctx context.Context, blocks []models.Block) error {
+	maxHeight := int32(0)
+	for _, b := range blocks {
+		if b.Height > maxHeight {
+			maxHeight = b.Height
+		}
+	}
+
+	// Calculate the partition bounds for the current max height in this batch
+	// e.g. if height is 1,050,000, we need partition from 1,000,000 to 1,100,000
+	startRange := (maxHeight / 100000) * 100000
+	endRange := startRange + 100000
+
+	// Also check for the next partition just in case we are near the boundary
+	if maxHeight+1000 >= endRange {
+		if err := w.createPartitionIfMissing(ctx, endRange, endRange+100000); err != nil {
+			return err
+		}
+	}
+
+	return w.createPartitionIfMissing(ctx, startRange, endRange)
+}
+
+func (w *Writer) createPartitionIfMissing(ctx context.Context, start, end int32) error {
+	suffix := fmt.Sprintf("%dk_%dk", start/1000, end/1000)
+	if start >= 1000000 {
+		suffix = fmt.Sprintf("%dm_%dm", start/1000000, end/1000000)
+		// Special case for the 1m boundary to match migration naming if needed, 
+		// but let's stick to a consistent naming: e.g. address_tx_1000k_1100k
+		suffix = fmt.Sprintf("%dk_%dk", start/1000, end/1000)
+	}
+
+	tables := []string{"transactions", "tx_outputs", "tx_inputs", "address_transactions"}
+	prefixMap := map[string]string{
+		"transactions":         "transactions",
+		"tx_outputs":           "tx_outputs",
+		"tx_inputs":            "tx_inputs",
+		"address_transactions": "address_tx",
+	}
+
+	for _, table := range tables {
+		partitionName := fmt.Sprintf("%s_%s", prefixMap[table], suffix)
+
+		// Check if partition exists
+		var exists bool
+		err := w.pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT FROM information_schema.tables 
+				WHERE table_name = $1
+			)
+		`, partitionName).Scan(&exists)
+		if err != nil {
+			return err
+		}
+
+		if !exists {
+			slog.Info("Creating missing partition", "table", table, "partition", partitionName, "start", start, "end", end)
+			query := fmt.Sprintf(
+				"CREATE TABLE %s PARTITION OF %s FOR VALUES FROM (%d) TO (%d)",
+				partitionName, table, start, end,
+			)
+			if _, err := w.pool.Exec(ctx, query); err != nil {
+				return fmt.Errorf("failed to create partition %s: %w", partitionName, err)
+			}
+		}
 	}
 
 	return nil

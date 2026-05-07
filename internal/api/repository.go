@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"github.com/Abhinav7903/bitcoin-indexer/internal/models"
 	"github.com/jackc/pgx/v5"
@@ -79,17 +80,17 @@ func (r *Repository) GetAddressInfo(ctx context.Context, address string) (*Addre
 func (r *Repository) GetAddressTransactions(ctx context.Context, address string, direction string, limit, offset int) ([]AddressTransaction, error) {
 	roleFilter := ""
 	switch direction {
-	case "in":
-		roleFilter = "AND role IN (0, 2)"
-	case "out":
-		roleFilter = "AND role IN (1, 2)"
+	case "in": // Sender in user's convention
+		roleFilter = "AND role = 1"
+	case "out": // Receiver in user's convention
+		roleFilter = "AND role = 0"
 	}
 
 	query := fmt.Sprintf(`
 		SELECT txid, block_height, block_time, net_value_sats, role
 		FROM address_transactions
 		WHERE address = $1 %s
-		ORDER BY block_height DESC, tx_index DESC
+		ORDER BY block_height DESC
 		LIMIT $2 OFFSET $3
 	`, roleFilter)
 
@@ -97,6 +98,7 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	var txs []AddressTransaction
 	for rows.Next() {
@@ -105,7 +107,6 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 		var role int16
 		err := rows.Scan(&txid, &tx.BlockHeight, &tx.BlockTime, &tx.NetValueSats, &role)
 		if err != nil {
-			rows.Close()
 			return nil, err
 		}
 		tx.Txid = hex.EncodeToString(txid)
@@ -113,10 +114,11 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 		tx.Direction = formatDirection(role)
 		txs = append(txs, tx)
 	}
-	rows.Close()
 
-	if len(txs) > 0 && direction == "" {
-		return txs, nil
+	if len(txs) > 0 || direction != "" {
+		if len(txs) > 0 {
+			return txs, nil
+		}
 	}
 
 	// Fallback for historical sync: Query tx_outputs joined with blocks for ordering
@@ -131,11 +133,10 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 			WHERE address = $1 AND is_spent = TRUE
 		),
 		aggregated AS (
-			SELECT txid, block_height, SUM(net_value) as net_value_sats, 
-			       CASE WHEN COUNT(*) > 1 THEN 2 ELSE MAX(role) END as role
+			SELECT txid, block_height, SUM(net_value) as net_value_sats, role
 			FROM combined
 			WHERE txid IS NOT NULL
-			GROUP BY txid, block_height
+			GROUP BY txid, block_height, role
 		)
 		SELECT a.txid, a.block_height, b.block_time, a.net_value_sats, a.role
 		FROM aggregated a
@@ -143,7 +144,7 @@ func (r *Repository) GetAddressTransactions(ctx context.Context, address string,
 		WHERE 1=1 %s
 		ORDER BY a.block_height DESC
 		LIMIT $2 OFFSET $3
-	`, roleFilter)
+	`, strings.ReplaceAll(roleFilter, "role", "a.role"))
 
 	rows, err = r.pool.Query(ctx, fallbackQuery, address, limit, offset)
 	if err != nil {
@@ -316,9 +317,9 @@ func formatRole(role int16) string {
 func formatDirection(role int16) string {
 	switch role {
 	case models.RoleReceiver:
-		return "IN"
-	case models.RoleSender:
 		return "OUT"
+	case models.RoleSender:
+		return "IN"
 	case models.RoleBoth:
 		return "BOTH"
 	default:
