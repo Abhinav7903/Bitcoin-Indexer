@@ -270,7 +270,7 @@ func (p *Pipeline) ingestRange(ctx context.Context, start, end int32) error {
 	dbDuration := time.Since(dbStartTime)
 
 	if err == nil {
-		log.Printf("Batch %d-%d: Fetched %d blocks (%d txs) in %v, DB write in %v",
+		log.Printf("Batch %d-%d: fetched %d blocks (%d txs) in %v wall time, DB write in %v",
 			start, end, count, totalTxs, fetchDuration, dbDuration)
 	}
 
@@ -279,14 +279,21 @@ func (p *Pipeline) ingestRange(ctx context.Context, start, end int32) error {
 
 func (p *Pipeline) fetchBlock(height int32) blockResult {
 	rpcStart := time.Now()
+
+	hashStart := time.Now()
 	hash, err := p.rpcClient.GetBlockHash(height)
+	hashDuration := time.Since(hashStart)
 	if err != nil {
 		return blockResult{err: err}
 	}
+
+	blockStart := time.Now()
 	rawBlock, err := p.rpcClient.GetBlockVerbose(hash)
+	blockDuration := time.Since(blockStart)
 	if err != nil {
 		return blockResult{err: err}
 	}
+
 	rpcDuration := time.Since(rpcStart)
 
 	parseStart := time.Now()
@@ -296,7 +303,8 @@ func (p *Pipeline) fetchBlock(height int32) blockResult {
 	if res.err == nil {
 		// Only log if it's taking significant time, or if you want to see every block
 		if rpcDuration > 500*time.Millisecond || parseDuration > 100*time.Millisecond {
-			log.Printf("Block %d: RPC %v, Parse %v (%d txs)", height, rpcDuration, parseDuration, len(res.txs))
+			log.Printf("Block %d: RPC total=%v getblockhash=%v getblock=%v parse=%v (%d txs)",
+				height, rpcDuration, hashDuration, blockDuration, parseDuration, len(res.txs))
 		}
 	}
 
