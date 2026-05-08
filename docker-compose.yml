@@ -1,6 +1,6 @@
 services:
   db:
-    image: apache/age:latest
+    image: apache/age:PG16_latest
     environment:
       POSTGRES_USER: hornet
       POSTGRES_PASSWORD: H0rnSt@r

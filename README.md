@@ -7,8 +7,8 @@ The indexer is designed for historical sync and address/transaction lookup workl
 ## Tech Stack
 
 - Go 1.22+
-- PostgreSQL 16
-- Apache AGE for graph queries
+- PostgreSQL 16 (Required for Apache AGE; versions > 16 are not supported)
+- Apache AGE for graph queries (Compatible with PostgreSQL 16)
 - `pgx/v5` for PostgreSQL access
 - Bitcoin Core RPC with `getblock` verbosity `2`
 - Docker Compose for local PostgreSQL/AGE
