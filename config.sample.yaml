@@ -1,0 +1,6 @@
+database_url: "postgres://user:password@localhost:5432/dbname?sslmode=disable"
+rpc_url: "http://rpcuser:rpcpassword@127.0.0.1:8332"
+workers: 12
+batch_size: 2
+start_height: 0
+historical_sync: true
