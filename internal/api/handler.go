@@ -12,61 +12,151 @@ type Handler struct {
 }
 
 func NewHandler(repo *Repository) *Handler {
-	return &Handler{repo: repo}
+	return &Handler{
+		repo: repo,
+	}
 }
 
 func (h *Handler) GetAddress(c *gin.Context) {
 	address := c.Param("address")
 	if address == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "address is required"})
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "address is required",
+		})
 		return
 	}
 
-	info, err := h.repo.GetAddressInfo(c.Request.Context(), address)
+	ctx := c.Request.Context()
+
+	// --------------------------------------------------
+	// Query params
+	// --------------------------------------------------
+
+	limit, err := strconv.Atoi(c.DefaultQuery("limit", "100"))
+	if err != nil || limit <= 0 {
+		limit = 100
+	}
+
+	// Hard limit protection
+	if limit > 500 {
+		limit = 500
+	}
+
+	offset, err := strconv.Atoi(c.DefaultQuery("offset", "0"))
+	if err != nil || offset < 0 {
+		offset = 0
+	}
+
+	direction := c.Query("direction")
+	if direction == "" {
+		direction = c.Query("role")
+	}
+
+	// --------------------------------------------------
+	// Mode
+	//
+	// compact -> use cached address_balances only
+	// compute -> recompute full stats dynamically
+	//
+	// default = compact
+	// --------------------------------------------------
+
+	mode := c.DefaultQuery("mode", "compact")
+
+	var (
+		info *AddressInfo
+	)
+
+	switch mode {
+
+	case "compute":
+
+		// Full expensive recomputation
+		info, err = h.repo.GetAddressInfoCompute(
+			ctx,
+			address,
+		)
+
+	default:
+
+		// Fast cached mode
+		info, err = h.repo.GetAddressInfoCompact(
+			ctx,
+			address,
+		)
+	}
+
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": err.Error(),
+		})
 		return
 	}
 
 	if info == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "address not found"})
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "address not found",
+		})
 		return
 	}
 
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
-	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
-	direction := c.Query("direction")
-	if direction == "" {
-		direction = c.Query("role") // fallback to 'role' if 'direction' is not provided
-	}
+	// --------------------------------------------------
+	// Transactions
+	// --------------------------------------------------
 
-	txs, err := h.repo.GetAddressTransactions(c.Request.Context(), address, direction, limit, offset)
+	txs, err := h.repo.GetAddressTransactions(
+		ctx,
+		address,
+		direction,
+		limit,
+		offset,
+	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": err.Error(),
+		})
 		return
 	}
+
+	// --------------------------------------------------
+	// Response
+	// --------------------------------------------------
 
 	c.JSON(http.StatusOK, gin.H{
+		"mode":         mode,
 		"info":         info,
 		"transactions": txs,
+		"limit":        limit,
+		"offset":       offset,
 	})
 }
-
 func (h *Handler) GetTransaction(c *gin.Context) {
 	txid := c.Param("txid")
 	if txid == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "txid is required"})
+		c.AbortWithStatusJSON(
+			http.StatusBadRequest,
+			gin.H{"error": "txid is required"},
+		)
 		return
 	}
 
-	tx, err := h.repo.GetTransaction(c.Request.Context(), txid)
+	tx, err := h.repo.GetTransaction(
+		c.Request.Context(),
+		txid,
+	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.AbortWithStatusJSON(
+			http.StatusInternalServerError,
+			gin.H{"error": err.Error()},
+		)
 		return
 	}
 
 	if tx == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "transaction not found"})
+		c.AbortWithStatusJSON(
+			http.StatusNotFound,
+			gin.H{"error": "transaction not found"},
+		)
 		return
 	}
 
@@ -76,13 +166,22 @@ func (h *Handler) GetTransaction(c *gin.Context) {
 func (h *Handler) GetTrace(c *gin.Context) {
 	txid := c.Param("txid")
 	if txid == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "txid is required"})
+		c.AbortWithStatusJSON(
+			http.StatusBadRequest,
+			gin.H{"error": "txid is required"},
+		)
 		return
 	}
 
-	descendants, err := h.repo.GetTrace(c.Request.Context(), txid)
+	descendants, err := h.repo.GetTrace(
+		c.Request.Context(),
+		txid,
+	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.AbortWithStatusJSON(
+			http.StatusInternalServerError,
+			gin.H{"error": err.Error()},
+		)
 		return
 	}
 

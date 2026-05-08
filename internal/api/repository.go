@@ -19,6 +19,128 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 	return &Repository{pool: pool}
 }
 
+func (r *Repository) GetAddressInfoCompact(
+	ctx context.Context,
+	address string,
+) (*AddressInfo, error) {
+
+	var info AddressInfo
+
+	err := r.pool.QueryRow(ctx, `
+		SELECT
+			address,
+			balance_sats,
+			total_received_sats,
+			total_sent_sats,
+			tx_count,
+			utxo_count,
+			COALESCE(first_seen_height, 0),
+			COALESCE(last_seen_height, 0)
+		FROM address_balances
+		WHERE address = $1
+	`, address).Scan(
+		&info.Address,
+		&info.BalanceSats,
+		&info.TotalReceivedSats,
+		&info.TotalSentSats,
+		&info.TxCount,
+		&info.UtxoCount,
+		&info.FirstSeenHeight,
+		&info.LastSeenHeight,
+	)
+
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &info, nil
+}
+
+func (r *Repository) GetAddressInfoCompute(
+	ctx context.Context,
+	address string,
+) (*AddressInfo, error) {
+
+	var info AddressInfo
+
+	info.Address = address
+
+	// ----------------------------------------
+	// Balance + UTXOs
+	// ----------------------------------------
+
+	err := r.pool.QueryRow(ctx, `
+		SELECT
+			COALESCE(SUM(value_sats), 0),
+			COUNT(*)
+		FROM utxo_set
+		WHERE address = $1
+	`, address).Scan(
+		&info.BalanceSats,
+		&info.UtxoCount,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// ----------------------------------------
+	// Stats
+	// ----------------------------------------
+
+	err = r.pool.QueryRow(ctx, `
+		WITH txs AS (
+
+			SELECT
+				txid,
+				block_height,
+				value_sats AS received,
+				0 AS sent
+			FROM tx_outputs
+			WHERE address = $1
+
+			UNION ALL
+
+			SELECT
+				spending_txid,
+				spent_height,
+				0 AS received,
+				value_sats AS sent
+			FROM tx_outputs
+			WHERE address = $1
+				AND is_spent = TRUE
+				AND spending_txid IS NOT NULL
+		)
+
+		SELECT
+			COUNT(DISTINCT txid),
+			COALESCE(MIN(block_height), 0),
+			COALESCE(MAX(block_height), 0),
+			COALESCE(SUM(received), 0),
+			COALESCE(SUM(sent), 0)
+		FROM txs
+	`, address).Scan(
+		&info.TxCount,
+		&info.FirstSeenHeight,
+		&info.LastSeenHeight,
+		&info.TotalReceivedSats,
+		&info.TotalSentSats,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if info.TxCount == 0 &&
+		info.UtxoCount == 0 {
+		return nil, nil
+	}
+
+	return &info, nil
+}
+
 func (r *Repository) GetAddressInfo(ctx context.Context, address string) (*AddressInfo, error) {
 	var info AddressInfo
 	err := r.pool.QueryRow(ctx, `
