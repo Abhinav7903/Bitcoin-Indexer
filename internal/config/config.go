@@ -8,19 +8,21 @@ import (
 )
 
 type Config struct {
-	DatabaseURL string `yaml:"database_url"`
-	RPCURL      string `yaml:"rpc_url"`
-	Workers     int    `yaml:"workers"`
-	BatchSize   int    `yaml:"batch_size"`
-	StartHeight int32  `yaml:"start_height"`
-	Port        int    `yaml:"port"`
+	DatabaseURL    string `yaml:"database_url"`
+	RPCURL         string `yaml:"rpc_url"`
+	Workers        int    `yaml:"workers"`
+	BatchSize      int    `yaml:"batch_size"`
+	StartHeight    int32  `yaml:"start_height"`
+	Port           int    `yaml:"port"`
+	HistoricalSync bool   `yaml:"historical_sync"`
 }
 
 func Load(path string) (*Config, error) {
 	cfg := &Config{
-		Workers:   10,
-		BatchSize: 100,
-		Port:      8080,
+		Workers:        10,
+		BatchSize:      100,
+		Port:           8080,
+		HistoricalSync: true,
 	}
 
 	// Try to load from YAML if it exists
@@ -59,6 +61,11 @@ func Load(path string) (*Config, error) {
 	if env := os.Getenv("PORT"); env != "" {
 		if val, err := strconv.Atoi(env); err == nil {
 			cfg.Port = val
+		}
+	}
+	if env := os.Getenv("HISTORICAL_SYNC"); env != "" {
+		if val, err := strconv.ParseBool(env); err == nil {
+			cfg.HistoricalSync = val
 		}
 	}
 

@@ -8,9 +8,9 @@ import (
 	"os"
 	"time"
 
-	"gopkg.in/yaml.v3"
 	"github.com/Abhinav7903/bitcoin-indexer/internal/models"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"gopkg.in/yaml.v3"
 )
 
 type BackfillConfig struct {
@@ -84,7 +84,6 @@ func main() {
 	slog.Info("Backfill completed successfully")
 }
 
-
 func backfillRole1(ctx context.Context, pool *pgxpool.Pool, start, end, batch int32) error {
 	if end == -1 {
 		err := pool.QueryRow(ctx, "SELECT COALESCE(MAX(height), 0) FROM blocks").Scan(&end)
@@ -125,6 +124,8 @@ func backfillRole1(ctx context.Context, pool *pgxpool.Pool, start, end, batch in
 			JOIN blocks b ON b.height = o.spent_height
 			WHERE o.is_spent = TRUE 
 			  AND o.address IS NOT NULL
+			  AND o.spending_txid IS NOT NULL
+			  AND o.spent_height IS NOT NULL
 			  AND o.spent_height BETWEEN $2 AND $3
 			GROUP BY o.address, o.spent_height, t.tx_index, o.spending_txid, b.block_time
 			ON CONFLICT DO NOTHING
@@ -134,10 +135,10 @@ func backfillRole1(ctx context.Context, pool *pgxpool.Pool, start, end, batch in
 			return fmt.Errorf("failed to backfill batch %d-%d: %w", current, next, err)
 		}
 
-		slog.Info("Batch completed", 
-			"from", current, 
-			"to", next, 
-			"inserted", tag.RowsAffected(), 
+		slog.Info("Batch completed",
+			"from", current,
+			"to", next,
+			"inserted", tag.RowsAffected(),
 			"duration", time.Since(startBatch))
 	}
 
@@ -197,7 +198,10 @@ func backfillBalances(ctx context.Context, pool *pgxpool.Pool) error {
 				-- All Sent
 				SELECT address, spending_txid, spent_height, -value_sats as delta, 0 as received, value_sats as sent 
 				FROM tx_outputs 
-				WHERE address LIKE $1 || '%' AND is_spent = TRUE
+				WHERE address LIKE $1 || '%'
+				  AND is_spent = TRUE
+				  AND spending_txid IS NOT NULL
+				  AND spent_height IS NOT NULL
 			) combined
 			GROUP BY address
 		`, p)

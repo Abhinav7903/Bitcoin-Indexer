@@ -113,7 +113,7 @@ func main() {
 
 	dbWriter := db.NewWriter(
 		pool,
-		true,
+		cfg.HistoricalSync,
 	)
 
 	// --------------------------------------------------
