@@ -143,4 +143,4 @@ Contributions are welcome. See the [Contributing Guide](../CONTRIBUTING.md) and 
 
 ## License
 
-[MIT License](../LICENSE)
+[MIT License](https://github.com/Abhinav7903/Bitcoin-indx/blob/main/LICENSE)
