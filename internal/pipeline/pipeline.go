@@ -45,58 +45,72 @@ func NewPipeline(rpcClient *rpc.Client, dbWriter *db.Writer, workers, batchSize 
 
 func (p *Pipeline) Run(ctx context.Context, startHeight int32) error {
 
+	var (
+		cachedInfo     *rpc.BlockchainInfo
+		lastInfoUpdate time.Time
+	)
+
+	const safeConfirmations int32 = 10
+
 	for {
 
 		// ----------------------------------------
-		// Fetch blockchain sync state
+		// Refresh blockchain info every 5 seconds
 		// ----------------------------------------
 
-		info, err := p.rpcClient.GetBlockchainInfo()
-		if err != nil {
-			return err
-		}
+		if cachedInfo == nil ||
+			time.Since(lastInfoUpdate) > 5*time.Second {
 
-		log.Printf(
-			"RPC blockchain info | blocks=%d headers=%d ibd=%v",
-			info.Blocks,
-			info.Headers,
-			info.InitialBlockDownload,
-		)
+			info, err := p.rpcClient.GetBlockchainInfo()
+			if err != nil {
 
-		blocks := int32(info.Blocks)
-		headers := int32(info.Headers)
+				log.Printf(
+					"Failed to fetch blockchain info: %v",
+					err,
+				)
 
-		var safeTip int32
+				select {
 
-		if info.InitialBlockDownload {
+				case <-ctx.Done():
+					return ctx.Err()
 
-			// historical sync mode
-			safeTip = blocks
+				case <-time.After(15 * time.Second):
+					continue
+				}
+			}
 
-		} else {
+			cachedInfo = info
+			lastInfoUpdate = time.Now()
 
-			// live chain safety lag
-			const safeConfirmations int32 = 10
+			log.Printf(
+				"RPC blockchain info | blocks=%d headers=%d ibd=%v",
+				info.Blocks,
+				info.Headers,
+				info.InitialBlockDownload,
+			)
 
-			safeTip = blocks - safeConfirmations
+			if info.Blocks < info.Headers {
 
-			if safeTip < 0 {
-				safeTip = 0
+				log.Printf(
+					"Bitcoin node syncing | blocks=%d headers=%d remaining=%d",
+					info.Blocks,
+					info.Headers,
+					info.Headers-info.Blocks,
+				)
 			}
 		}
 
+		blocks := int32(cachedInfo.Blocks)
+		headers := int32(cachedInfo.Headers)
+
 		// ----------------------------------------
-		// Node still syncing
+		// Always stay behind tip
 		// ----------------------------------------
 
-		if blocks < headers {
+		safeTip := blocks - safeConfirmations
 
-			log.Printf(
-				"Bitcoin node syncing | blocks=%d headers=%d remaining=%d",
-				blocks,
-				headers,
-				headers-blocks,
-			)
+		if safeTip < 0 {
+			safeTip = 0
 		}
 
 		// ----------------------------------------
@@ -149,13 +163,31 @@ func (p *Pipeline) Run(ctx context.Context, startHeight int32) error {
 			startHeight,
 			endHeight,
 		); err != nil {
-			return err
+
+			log.Printf(
+				"Ingestion error (%d-%d): %v",
+				startHeight,
+				endHeight,
+				err,
+			)
+
+			log.Printf(
+				"Retrying in 15 seconds...",
+			)
+
+			select {
+
+			case <-ctx.Done():
+				return ctx.Err()
+
+			case <-time.After(15 * time.Second):
+				continue
+			}
 		}
 
 		startHeight = endHeight + 1
 	}
 }
-
 func (p *Pipeline) ingestRange(ctx context.Context, start, end int32) error {
 	count := int(end - start + 1)
 	startTime := time.Now()
