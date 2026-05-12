@@ -352,17 +352,20 @@ func copyInputs(
 
 	// -------------------------------------------------------
 	// Create temp table for spend lookups.
-	// PERF: Add an index on (prev_txid, prev_vout) so the
-	// UPDATE and DELETE below use hash joins instead of
-	// nested loops when the batch is large.
+	// prev_block_height is populated after COPY so the UPDATE
+	// on tx_outputs can include block_height in the WHERE
+	// clause — this lets Postgres prune to a single partition
+	// instead of scanning all 12+, which is the main cause of
+	// the multi-minute UPDATE stalls.
 	// -------------------------------------------------------
 	if _, err = tx.Exec(ctx, `
 CREATE TEMP TABLE temp_spent_inputs (
-	prev_txid    BYTEA NOT NULL,
-	prev_vout    INT   NOT NULL,
-	spending_txid BYTEA NOT NULL,
-	spending_vin  INT  NOT NULL,
-	spent_height  INT  NOT NULL
+	prev_txid         BYTEA NOT NULL,
+	prev_vout         INT   NOT NULL,
+	spending_txid     BYTEA NOT NULL,
+	spending_vin      INT   NOT NULL,
+	spent_height      INT   NOT NULL,
+	prev_block_height INT   -- filled in after COPY via UPDATE
 ) ON COMMIT DROP
 `); err != nil {
 		return false, fmt.Errorf(
@@ -402,12 +405,24 @@ CREATE TEMP TABLE temp_spent_inputs (
 		)
 	}
 
-	// PERF: Index the temp table so UPDATE tx_outputs and DELETE utxo_set
-	// can use an index scan instead of a seq scan on the temp table.
+	// Index first so the self-join that resolves prev_block_height is fast.
 	if _, err = tx.Exec(ctx, `
 CREATE INDEX ON temp_spent_inputs (prev_txid, prev_vout)
 `); err != nil {
 		return false, fmt.Errorf("index temp_spent_inputs: %w", err)
+	}
+
+	// Resolve the block_height of each referenced output.
+	// This is a small scan against tx_outputs using the existing
+	// idx_txout_txid index — typically milliseconds.
+	if _, err = tx.Exec(ctx, `
+UPDATE temp_spent_inputs s
+SET prev_block_height = o.block_height
+FROM tx_outputs o
+WHERE o.txid     = s.prev_txid
+  AND o.vout_idx = s.prev_vout
+`); err != nil {
+		return false, fmt.Errorf("resolve prev_block_height: %w", err)
 	}
 
 	return true, nil
@@ -418,12 +433,11 @@ func applySpendState(
 	tx pgx.Tx,
 ) error {
 
-	// PERF: Use a hash join hint via enable_nestloop=off for this session
-	// so Postgres prefers a hash join over nested loops on partitioned tables.
-	if _, err := tx.Exec(ctx, "SET LOCAL enable_nestloop = OFF"); err != nil {
-		return fmt.Errorf("set enable_nestloop: %w", err)
-	}
-
+	// PERF: Include block_height in the WHERE clause so Postgres can
+	// prune to a single partition per row instead of scanning all
+	// partitions.  prev_block_height was resolved in copyInputs above.
+	// Rows where prev_block_height is NULL (coinbase / already-spent edge
+	// cases) are skipped safely by the IS NOT NULL guard.
 	if _, err := tx.Exec(ctx, `
 UPDATE tx_outputs o
 SET is_spent      = TRUE,
@@ -431,18 +445,15 @@ SET is_spent      = TRUE,
     spending_vin  = s.spending_vin,
     spent_height  = s.spent_height
 FROM temp_spent_inputs s
-WHERE o.txid     = s.prev_txid
-  AND o.vout_idx = s.prev_vout
+WHERE s.prev_block_height IS NOT NULL
+  AND o.block_height = s.prev_block_height
+  AND o.txid         = s.prev_txid
+  AND o.vout_idx     = s.prev_vout
 `); err != nil {
 		return fmt.Errorf(
 			"mark spent tx_outputs: %w",
 			err,
 		)
-	}
-
-	// Restore planner defaults for subsequent queries.
-	if _, err := tx.Exec(ctx, "SET LOCAL enable_nestloop = ON"); err != nil {
-		return fmt.Errorf("restore enable_nestloop: %w", err)
 	}
 
 	return deleteSpentUTXOs(ctx, tx)
@@ -533,14 +544,16 @@ SELECT o.address,
        b.block_time
 FROM temp_spent_inputs s
 JOIN tx_outputs o
-  ON o.txid     = s.prev_txid
- AND o.vout_idx = s.prev_vout
+  ON o.block_height = s.prev_block_height
+ AND o.txid         = s.prev_txid
+ AND o.vout_idx     = s.prev_vout
 JOIN transactions t
   ON t.block_height = s.spent_height
  AND t.txid         = s.spending_txid
 JOIN blocks b
   ON b.height = s.spent_height
-WHERE o.address IS NOT NULL
+WHERE s.prev_block_height IS NOT NULL
+  AND o.address IS NOT NULL
 GROUP BY
 	o.address,
 	s.spent_height,
@@ -672,9 +685,11 @@ SELECT o.address,
        s.spent_height
 FROM temp_spent_inputs s
 JOIN tx_outputs o
-  ON o.txid     = s.prev_txid
- AND o.vout_idx = s.prev_vout
-WHERE o.address IS NOT NULL
+  ON o.block_height = s.prev_block_height
+ AND o.txid         = s.prev_txid
+ AND o.vout_idx     = s.prev_vout
+WHERE s.prev_block_height IS NOT NULL
+  AND o.address IS NOT NULL
 `); err != nil {
 			return fmt.Errorf(
 				"copy sender temp_address_deltas: %w",
