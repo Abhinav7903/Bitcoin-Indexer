@@ -78,15 +78,17 @@ func (w *Writer) SaveBlockBatch(
 		return err
 	}
 
-	// receiver rows are cheap
-	if err := copyReceiverAddressTransactions(
-		ctx,
-		tx,
-		addrTxs,
-	); err != nil {
-		return err
-	}
-
+	// Skip address_transactions during historical sync.
+// The backfill tool reconstructs them after catch-up.
+if !w.historicalSync {
+    if err := copyReceiverAddressTransactions(
+        ctx,
+        tx,
+        addrTxs,
+    ); err != nil {
+        return err
+    }
+}
 	if spentInputsReady {
 		if err := applySpendState(ctx, tx); err != nil {
 			return err
