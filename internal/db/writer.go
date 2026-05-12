@@ -48,6 +48,15 @@ func (w *Writer) SaveBlockBatch(
 	}
 	defer tx.Rollback(ctx)
 
+	// -------------------------------------------------------
+	// PERF: Disable synchronous_commit for this session.
+	// Safe for historical backfill — worst case on crash we
+	// re-index the last batch (idempotent via ON CONFLICT).
+	// -------------------------------------------------------
+	if _, err := tx.Exec(ctx, "SET LOCAL synchronous_commit = OFF"); err != nil {
+		return fmt.Errorf("set synchronous_commit: %w", err)
+	}
+
 	// -----------------------------------
 	// Immutable blockchain data
 	// -----------------------------------
@@ -77,8 +86,6 @@ func (w *Writer) SaveBlockBatch(
 	); err != nil {
 		return err
 	}
-
-
 
 	if spentInputsReady {
 		if err := applySpendState(ctx, tx); err != nil {
@@ -343,17 +350,21 @@ func copyInputs(
 		return false, nil
 	}
 
-	_, err = tx.Exec(ctx, `
+	// -------------------------------------------------------
+	// Create temp table for spend lookups.
+	// PERF: Add an index on (prev_txid, prev_vout) so the
+	// UPDATE and DELETE below use hash joins instead of
+	// nested loops when the batch is large.
+	// -------------------------------------------------------
+	if _, err = tx.Exec(ctx, `
 CREATE TEMP TABLE temp_spent_inputs (
-	prev_txid BYTEA,
-	prev_vout INT,
-	spending_txid BYTEA,
-	spending_vin INT,
-	spent_height INT
+	prev_txid    BYTEA NOT NULL,
+	prev_vout    INT   NOT NULL,
+	spending_txid BYTEA NOT NULL,
+	spending_vin  INT  NOT NULL,
+	spent_height  INT  NOT NULL
 ) ON COMMIT DROP
-`)
-
-	if err != nil {
+`); err != nil {
 		return false, fmt.Errorf(
 			"create temp_spent_inputs: %w",
 			err,
@@ -391,6 +402,14 @@ CREATE TEMP TABLE temp_spent_inputs (
 		)
 	}
 
+	// PERF: Index the temp table so UPDATE tx_outputs and DELETE utxo_set
+	// can use an index scan instead of a seq scan on the temp table.
+	if _, err = tx.Exec(ctx, `
+CREATE INDEX ON temp_spent_inputs (prev_txid, prev_vout)
+`); err != nil {
+		return false, fmt.Errorf("index temp_spent_inputs: %w", err)
+	}
+
 	return true, nil
 }
 
@@ -399,20 +418,31 @@ func applySpendState(
 	tx pgx.Tx,
 ) error {
 
+	// PERF: Use a hash join hint via enable_nestloop=off for this session
+	// so Postgres prefers a hash join over nested loops on partitioned tables.
+	if _, err := tx.Exec(ctx, "SET LOCAL enable_nestloop = OFF"); err != nil {
+		return fmt.Errorf("set enable_nestloop: %w", err)
+	}
+
 	if _, err := tx.Exec(ctx, `
 UPDATE tx_outputs o
-SET is_spent = TRUE,
+SET is_spent      = TRUE,
     spending_txid = s.spending_txid,
-    spending_vin = s.spending_vin,
-    spent_height = s.spent_height
+    spending_vin  = s.spending_vin,
+    spent_height  = s.spent_height
 FROM temp_spent_inputs s
-WHERE o.txid = s.prev_txid
+WHERE o.txid     = s.prev_txid
   AND o.vout_idx = s.prev_vout
 `); err != nil {
 		return fmt.Errorf(
 			"mark spent tx_outputs: %w",
 			err,
 		)
+	}
+
+	// Restore planner defaults for subsequent queries.
+	if _, err := tx.Exec(ctx, "SET LOCAL enable_nestloop = ON"); err != nil {
+		return fmt.Errorf("restore enable_nestloop: %w", err)
 	}
 
 	return deleteSpentUTXOs(ctx, tx)
@@ -426,7 +456,7 @@ func deleteSpentUTXOs(
 	if _, err := tx.Exec(ctx, `
 DELETE FROM utxo_set u
 USING temp_spent_inputs s
-WHERE u.txid = s.prev_txid
+WHERE u.txid     = s.prev_txid
   AND u.vout_idx = s.prev_vout
 `); err != nil {
 		return fmt.Errorf(
@@ -503,11 +533,11 @@ SELECT o.address,
        b.block_time
 FROM temp_spent_inputs s
 JOIN tx_outputs o
-  ON o.txid = s.prev_txid
+  ON o.txid     = s.prev_txid
  AND o.vout_idx = s.prev_vout
 JOIN transactions t
   ON t.block_height = s.spent_height
- AND t.txid = s.spending_txid
+ AND t.txid         = s.spending_txid
 JOIN blocks b
   ON b.height = s.spent_height
 WHERE o.address IS NOT NULL
@@ -578,11 +608,11 @@ func updateAddressBalances(
 
 	if _, err := tx.Exec(ctx, `
 CREATE TEMP TABLE temp_address_deltas (
-	address TEXT,
-	delta BIGINT,
-	received BIGINT,
-	sent BIGINT,
-	block_height INT
+	address      TEXT   NOT NULL,
+	delta        BIGINT NOT NULL,
+	received     BIGINT NOT NULL,
+	sent         BIGINT NOT NULL,
+	block_height INT    NOT NULL
 ) ON COMMIT DROP
 `); err != nil {
 		return fmt.Errorf(
@@ -642,7 +672,7 @@ SELECT o.address,
        s.spent_height
 FROM temp_spent_inputs s
 JOIN tx_outputs o
-  ON o.txid = s.prev_txid
+  ON o.txid     = s.prev_txid
  AND o.vout_idx = s.prev_vout
 WHERE o.address IS NOT NULL
 `); err != nil {
@@ -651,6 +681,55 @@ WHERE o.address IS NOT NULL
 				err,
 			)
 		}
+	}
+
+	// -------------------------------------------------------
+	// PERF: Index temp_address_deltas so the utxo_set join
+	// below and the GROUP BY use a hash strategy, not nested
+	// loops. Also aggregate deltas first so the upsert touches
+	// fewer rows in address_balances.
+	// -------------------------------------------------------
+	if _, err := tx.Exec(ctx, `
+CREATE INDEX ON temp_address_deltas (address)
+`); err != nil {
+		return fmt.Errorf("index temp_address_deltas: %w", err)
+	}
+
+	// PERF: Pre-aggregate all deltas per address into a second temp table.
+	// This reduces the number of rows that hit the address_balances upsert
+	// and avoids a correlated subquery on utxo_set for every row.
+	if _, err := tx.Exec(ctx, `
+CREATE TEMP TABLE temp_address_agg AS
+SELECT
+	d.address,
+	SUM(d.delta)    AS balance_delta,
+	SUM(d.received) AS received_delta,
+	SUM(d.sent)     AS sent_delta,
+	COUNT(*)        AS tx_delta,
+	MIN(d.block_height) AS min_height,
+	MAX(d.block_height) AS max_height,
+	COALESCE(u.utxo_count, 0) AS utxo_count
+FROM (
+	SELECT address,
+	       SUM(delta)    AS delta,
+	       SUM(received) AS received,
+	       SUM(sent)     AS sent,
+	       block_height
+	FROM temp_address_deltas
+	GROUP BY address, block_height
+) d
+LEFT JOIN (
+	SELECT address, COUNT(*)::INT AS utxo_count
+	FROM utxo_set
+	WHERE address IN (
+		SELECT DISTINCT address FROM temp_address_deltas
+	)
+	GROUP BY address
+) u ON u.address = d.address
+GROUP BY d.address, u.utxo_count
+ON COMMIT DROP
+`); err != nil {
+		return fmt.Errorf("create temp_address_agg: %w", err)
 	}
 
 	_, err := tx.Exec(ctx, `
@@ -665,27 +744,17 @@ INSERT INTO address_balances (
 	last_seen_height,
 	updated_at_height
 )
-SELECT d.address,
-       SUM(d.delta),
-       SUM(d.received),
-       SUM(d.sent),
-       COALESCE(u.utxo_count, 0),
-       COUNT(*),
-       MIN(d.block_height),
-       MAX(d.block_height),
-       MAX(d.block_height)
-FROM temp_address_deltas d
-LEFT JOIN (
-	SELECT address,
-	       COUNT(*)::INT AS utxo_count
-	FROM utxo_set
-	WHERE address IN (
-		SELECT DISTINCT address
-		FROM temp_address_deltas
-	)
-	GROUP BY address
-) u ON u.address = d.address
-GROUP BY d.address, u.utxo_count
+SELECT
+	address,
+	balance_delta,
+	received_delta,
+	sent_delta,
+	utxo_count,
+	tx_delta,
+	min_height,
+	max_height,
+	max_height
+FROM temp_address_agg
 ON CONFLICT (address)
 DO UPDATE SET
 	balance_sats =
@@ -699,18 +768,12 @@ DO UPDATE SET
 		address_balances.tx_count + EXCLUDED.tx_count,
 	first_seen_height =
 		LEAST(
-			COALESCE(
-				address_balances.first_seen_height,
-				EXCLUDED.first_seen_height
-			),
+			COALESCE(address_balances.first_seen_height, EXCLUDED.first_seen_height),
 			EXCLUDED.first_seen_height
 		),
 	last_seen_height =
 		GREATEST(
-			COALESCE(
-				address_balances.last_seen_height,
-				EXCLUDED.last_seen_height
-			),
+			COALESCE(address_balances.last_seen_height, EXCLUDED.last_seen_height),
 			EXCLUDED.last_seen_height
 		),
 	updated_at_height =
@@ -751,8 +814,8 @@ VALUES (1, $1, $2, NOW())
 ON CONFLICT (id)
 DO UPDATE SET
 	last_indexed_height = EXCLUDED.last_indexed_height,
-	last_indexed_hash = EXCLUDED.last_indexed_hash,
-	updated_at = NOW()
+	last_indexed_hash   = EXCLUDED.last_indexed_hash,
+	updated_at          = NOW()
 `, last.Height, last.Hash)
 
 	if err != nil {
@@ -770,12 +833,9 @@ func (w *Writer) ensurePartitions(ctx context.Context, blocks []models.Block) er
 		}
 	}
 
-	// Calculate the partition bounds for the current max height in this batch
-	// e.g. if height is 1,050,000, we need partition from 1,000,000 to 1,100,000
 	startRange := (maxHeight / 100000) * 100000
 	endRange := startRange + 100000
 
-	// Also check for the next partition just in case we are near the boundary
 	if maxHeight+1000 >= endRange {
 		if err := w.createPartitionIfMissing(ctx, endRange, endRange+100000); err != nil {
 			return err
@@ -788,9 +848,6 @@ func (w *Writer) ensurePartitions(ctx context.Context, blocks []models.Block) er
 func (w *Writer) createPartitionIfMissing(ctx context.Context, start, end int32) error {
 	suffix := fmt.Sprintf("%dk_%dk", start/1000, end/1000)
 	if start >= 1000000 {
-		suffix = fmt.Sprintf("%dm_%dm", start/1000000, end/1000000)
-		// Special case for the 1m boundary to match migration naming if needed, 
-		// but let's stick to a consistent naming: e.g. address_tx_1000k_1100k
 		suffix = fmt.Sprintf("%dk_%dk", start/1000, end/1000)
 	}
 
@@ -805,11 +862,10 @@ func (w *Writer) createPartitionIfMissing(ctx context.Context, start, end int32)
 	for _, table := range tables {
 		partitionName := fmt.Sprintf("%s_%s", prefixMap[table], suffix)
 
-		// Check if partition exists
 		var exists bool
 		err := w.pool.QueryRow(ctx, `
 			SELECT EXISTS (
-				SELECT FROM information_schema.tables 
+				SELECT FROM information_schema.tables
 				WHERE table_name = $1
 			)
 		`, partitionName).Scan(&exists)
