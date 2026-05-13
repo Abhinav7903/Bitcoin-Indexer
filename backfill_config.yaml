@@ -1,7 +1,19 @@
-# Backfill Configuration
-database_url: "postgres://postgres:postgres@localhost:5432/bitcoin_indexer?sslmode=disable"
-batch_size: 5000
+database_url: "postgres://hornet:H0rnSt%40r@localhost:5432/btcindex?sslmode=disable"
+
+# Blocks per INSERT batch — 2000 is safe, go up to 5000 if you have 32GB+ RAM
+batch_size: 2000
+
+# Start from genesis. Change start_height if resuming a partial run.
 start_height: 0
-end_height: -1 # -1 means current tip
-skip_txs: false
-skip_balances: false
+end_height: -1    # -1 = auto detect MAX(height) from blocks table
+
+# Parallel workers. Keep <= (max_connections - 4).
+# With max_connections=50, use 8.
+workers: 8
+
+# Skip flags — only set true to resume after a crash mid-run.
+# For a FRESH backfill: all must be false.
+skip_receivers:   false
+skip_senders:     false
+skip_balances:    false
+skip_utxo_counts: false
