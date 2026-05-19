@@ -898,6 +898,7 @@ func (w *Writer) createPartitionIfMissing(
 		formatPartitionBound(start),
 		formatPartitionBound(end),
 	)
+	boundExpr := partitionBoundExpr(start, end)
 
 	prefixMap := map[string]string{
 		"transactions":         "transactions",
@@ -925,14 +926,10 @@ SELECT EXISTS (
 	WHERE parent.relname = $1
 	  AND (
 		child.relname = $2
-		OR pg_get_expr(child.relpartbound, child.oid) = format(
-			'FOR VALUES FROM (%s) TO (%s)',
-			$3,
-			$4
-		)
+		OR pg_get_expr(child.relpartbound, child.oid) = $3
 	  )
 )
-`, table, partitionName, start, end).Scan(&exists); err != nil {
+`, table, partitionName, boundExpr).Scan(&exists); err != nil {
 			return err
 		}
 
@@ -980,6 +977,10 @@ func formatPartitionBound(bound int32) string {
 	default:
 		return fmt.Sprintf("%d", bound)
 	}
+}
+
+func partitionBoundExpr(start, end int32) string {
+	return fmt.Sprintf("FOR VALUES FROM (%d) TO (%d)", start, end)
 }
 
 // ============================================================

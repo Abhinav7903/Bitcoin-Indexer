@@ -71,3 +71,11 @@ func TestFormatPartitionBoundMatchesMigrationNaming(t *testing.T) {
 		}
 	}
 }
+
+func TestPartitionBoundExprMatchesPostgresFormat(t *testing.T) {
+	got := partitionBoundExpr(900000, 1000000)
+	want := "FOR VALUES FROM (900000) TO (1000000)"
+	if got != want {
+		t.Fatalf("partitionBoundExpr() = %q, want %q", got, want)
+	}
+}
