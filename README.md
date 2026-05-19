@@ -366,6 +366,7 @@ fsync = off
 
 ## Log Reference
 
+### Syncing Mode (Historical/IBD)
 ```text
 # Node sync state
 RPC blockchain info | blocks=885293 headers=948406 ibd=true
@@ -377,6 +378,22 @@ Batch 140231-140232: fetched 2 blocks (228 txs) in 10.089s wall time, DB write i
 
 # Per-block RPC timing
 Block 140231: RPC total=10.084s getblockhash=10.062s getblock=21ms parse=1ms (97 txs)
+```
+
+### Production Log Example (Near-Tip / Post-IBD)
+```text
+May 19 11:33:48 BTCNODE env[1334]: 2026/05/19 11:33:48 RPC blockchain info | blocks=950040 headers=950040 ibd=false
+May 19 11:33:48 BTCNODE env[1334]: 2026/05/19 11:33:48 Ingesting blocks 946509 -> 946520 | safe_tip=950030 blocks=950040 headers=950040
+May 19 11:33:48 BTCNODE env[1334]: 2026/05/19 11:33:48 Block 946512: RPC total=501.973939ms getblockhash=615.768µs getblock=501.35786ms parse=33.135292ms (3769 txs)
+May 19 11:33:48 BTCNODE env[1334]: 2026/05/19 11:33:48 Block 946518: RPC total=545.464902ms getblockhash=662.991µs getblock=544.801651ms parse=27.55614ms (3983 txs)
+May 19 11:33:48 BTCNODE env[1334]: 2026/05/19 11:33:48 Block 946517: RPC total=566.984239ms getblockhash=647.007µs getblock=566.336992ms parse=18.25539ms (4648 txs)
+May 19 11:33:48 BTCNODE env[1334]: 2026/05/19 11:33:48 Block 946509: RPC total=581.676984ms getblockhash=624.198µs getblock=581.052516ms parse=34.166727ms (4420 txs)
+May 19 11:33:48 BTCNODE env[1334]: 2026/05/19 11:33:48 Block 946511: RPC total=586.501833ms getblockhash=628.803µs getblock=585.8727ms parse=40.230991ms (4323 txs)
+May 19 11:33:48 BTCNODE env[1334]: 2026/05/19 11:33:48 Block 946516: RPC total=606.389569ms getblockhash=599.285µs getblock=605.790023ms parse=28.803347ms (4041 txs)
+May 19 11:33:48 BTCNODE env[1334]: 2026/05/19 11:33:48 Block 946515: RPC total=640.605137ms getblockhash=691.955µs getblock=639.912932ms parse=21.149301ms (5070 txs)
+May 19 11:33:48 BTCNODE env[1334]: 2026/05/19 11:33:48 Block 946520: RPC total=674.063818ms getblockhash=663.253µs getblock=673.400294ms parse=12.213097ms (3765 txs)
+May 19 11:33:49 BTCNODE env[1334]: 2026/05/19 11:33:49 Batch 946509-946520: fetched 12 blocks (40371 txs) in 686.587487ms wall time, DB write in 842.097367ms
+May 19 11:33:49 BTCNODE env[1334]: 2026/05/19 11:33:49 Ingesting blocks 946521 -> 946532 | safe_tip=950030 blocks=950040 headers=950040
 ```
 
 ---
