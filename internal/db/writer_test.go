@@ -51,3 +51,23 @@ func TestAggregateAddressTransactionsSumsDuplicateAddressTxRows(t *testing.T) {
 		t.Fatalf("expected sender row to remain separate, got %d", got[1].NetValueSats)
 	}
 }
+
+func TestFormatPartitionBoundMatchesMigrationNaming(t *testing.T) {
+	cases := []struct {
+		bound int32
+		want  string
+	}{
+		{bound: 0, want: "0"},
+		{bound: 100000, want: "100k"},
+		{bound: 900000, want: "900k"},
+		{bound: 1000000, want: "1m"},
+		{bound: 1100000, want: "11m"},
+	}
+
+	for _, tc := range cases {
+		got := formatPartitionBound(tc.bound)
+		if got != tc.want {
+			t.Fatalf("formatPartitionBound(%d) = %q, want %q", tc.bound, got, tc.want)
+		}
+	}
+}

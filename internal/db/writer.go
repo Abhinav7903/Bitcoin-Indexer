@@ -893,7 +893,11 @@ func (w *Writer) createPartitionIfMissing(
 	end int32,
 ) error {
 
-	suffix := fmt.Sprintf("%dk_%dk", start/1000, end/1000)
+	suffix := fmt.Sprintf(
+		"%s_%s",
+		formatPartitionBound(start),
+		formatPartitionBound(end),
+	)
 
 	prefixMap := map[string]string{
 		"transactions":         "transactions",
@@ -914,10 +918,21 @@ func (w *Writer) createPartitionIfMissing(
 
 		if err := w.pool.QueryRow(ctx, `
 SELECT EXISTS (
-	SELECT FROM information_schema.tables
-	WHERE table_name = $1
+	SELECT 1
+	FROM pg_class child
+	JOIN pg_inherits inh ON inh.inhrelid = child.oid
+	JOIN pg_class parent ON parent.oid = inh.inhparent
+	WHERE parent.relname = $1
+	  AND (
+		child.relname = $2
+		OR pg_get_expr(child.relpartbound, child.oid) = format(
+			'FOR VALUES FROM (%s) TO (%s)',
+			$3,
+			$4
+		)
+	  )
 )
-`, partitionName).Scan(&exists); err != nil {
+`, table, partitionName, start, end).Scan(&exists); err != nil {
 			return err
 		}
 
@@ -949,6 +964,22 @@ SELECT EXISTS (
 	}
 
 	return nil
+}
+
+func formatPartitionBound(bound int32) string {
+	switch {
+	case bound == 0:
+		return "0"
+	case bound < 1_000_000:
+		return fmt.Sprintf("%dk", bound/1000)
+	case bound%1_000_000 == 0:
+		return fmt.Sprintf("%dm", bound/1_000_000)
+	case bound%100_000 == 0:
+		// Existing migrations use compact labels like 1m_11m.
+		return fmt.Sprintf("%dm", bound/100_000)
+	default:
+		return fmt.Sprintf("%d", bound)
+	}
 }
 
 // ============================================================

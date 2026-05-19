@@ -346,10 +346,17 @@ For fast historical sync:
 - Run Bitcoin Core and PostgreSQL on **SSD or NVMe** storage
 - Set a high `dbcache` in `bitcoin.conf` (16GB+ if RAM allows)
 - Keep `workers = batch_size` during IBD
+- **Two-Phase Ingestion**: For a massive speedup during initial historical sync, drop non-primary indexes by running the `0003_drop_indexes_for_sync.up.sql` migration. This avoids heavy index maintenance during the massive insert phase.
+  *Example performance with indexes dropped (sub-second DB writes for 10k+ txs!):*
+  ```text
+  Batch 508545-508556: fetched 12 blocks (11289 txs) in 306.89ms wall time, DB write in 325.67ms
+  Batch 508569-508580: fetched 12 blocks (10358 txs) in 338.80ms wall time, DB write in 414.92ms
+  Batch 508629-508640: fetched 12 blocks (8344 txs) in 306.84ms wall time, DB write in 292.78ms
+  ```
+  Once the sync reaches the tip, run the `0004_rebuild_indexes_post_sync.up.sql` migration to rebuild the indexes concurrently.
 - For PostgreSQL initial load only, you can temporarily set:
 
 ```conf
-wal_level = minimal
 fsync = off
 ```
 
