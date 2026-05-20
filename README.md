@@ -13,7 +13,7 @@
 
 ## Overview
 
-Bitcoin Indexer is an open-source, production-grade tool for indexing the full Bitcoin blockchain into a relational + graph database. It is designed for address/transaction lookups, UTXO tracking, analytics workloads, and historical backfills.
+Bitcoin Indexer is an open-source, high-performance open-source tool for indexing the full Bitcoin blockchain into a relational + graph database. It is designed for address/transaction lookups, UTXO tracking, analytics workloads, and historical backfills.
 
 It talks to Bitcoin Core over JSON-RPC, parses blocks concurrently, and writes everything to PostgreSQL using `COPY`-based batch inserts for maximum throughput.
 
@@ -160,8 +160,8 @@ getblockchaininfo
 ### 1. Clone
 
 ```bash
-git clone https://github.com/Abhinav7903/bitcoin-indexer.git
-cd bitcoin-indexer
+git clone https://github.com/Abhinav7903/Bitcoin-Indexer.git
+cd Bitcoin-Indexer
 ```
 
 ### 2. Configure
@@ -403,8 +403,8 @@ May 19 11:33:49 BTCNODE env[1334]: 2026/05/19 11:33:49 Ingesting blocks 946521 -
 ## Roadmap
 
 - [ ] Raw block RPC parsing (skip verbose JSON)
-- [X] Direct `blk*.dat` file ingestion (for faster historical sync but can be complex)
-- [X] Reorg-safe rollback pipeline (hard to implement and test properly)
+- [ ] Direct `blk*.dat` file ingestion (for faster historical sync but can be complex)
+- [ ] Reorg-safe rollback pipeline (can be complex)
 - [ ] Prometheus metrics endpoint
 - [ ] Swagger / OpenAPI docs
 - [ ] WebSocket new block notifications
