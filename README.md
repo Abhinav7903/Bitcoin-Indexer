@@ -1,6 +1,8 @@
 # ₿ Bitcoin Indexer
 
-> A high-performance Bitcoin blockchain indexer written in Go — ingests Bitcoin Core RPC data into PostgreSQL 16 with Apache AGE graph support.
+> Bitcoin Indexer is a blockchain data pipeline that transforms raw Bitcoin blocks into a structured PostgreSQL database for fast querying of transactions, addresses, and UTXOs.
+
+> A high-performance Bitcoin blockchain indexer written in Go that ingests Bitcoin Core RPC data in real time and builds a queryable PostgreSQL 16 database for transactions, UTXOs, and address history. It includes batch ingestion, partitioning, and optional graph-based analysis via Apache AGE.
 
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-336791?style=flat&logo=postgresql)](https://www.postgresql.org/)
