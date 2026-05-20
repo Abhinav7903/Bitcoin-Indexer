@@ -10,7 +10,7 @@ package main
 // 	"sync/atomic"
 // 	"time"
 
-// 	"github.com/Abhinav7903/bitcoin-indexer/internal/models"
+// 	"github.com/Abhinav7903/Bitcoin-Indexer/internal/models"
 // 	"github.com/jackc/pgx/v5/pgxpool"
 // 	"gopkg.in/yaml.v3"
 // )

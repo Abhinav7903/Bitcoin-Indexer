@@ -9,10 +9,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/Abhinav7903/bitcoin-indexer/internal/config"
-	"github.com/Abhinav7903/bitcoin-indexer/internal/db"
-	"github.com/Abhinav7903/bitcoin-indexer/internal/pipeline"
-	"github.com/Abhinav7903/bitcoin-indexer/pkg/rpc"
+	"github.com/Abhinav7903/Bitcoin-Indexer/internal/config"
+	"github.com/Abhinav7903/Bitcoin-Indexer/internal/db"
+	"github.com/Abhinav7903/Bitcoin-Indexer/internal/pipeline"
+	"github.com/Abhinav7903/Bitcoin-Indexer/pkg/rpc"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 

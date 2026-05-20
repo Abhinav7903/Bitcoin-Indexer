@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Abhinav7903/bitcoin-indexer/internal/models"
+	"github.com/Abhinav7903/Bitcoin-Indexer/internal/models"
 )
 
 func TestAggregateAddressTransactionsSumsDuplicateAddressTxRows(t *testing.T) {

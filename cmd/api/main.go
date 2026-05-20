@@ -10,8 +10,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Abhinav7903/bitcoin-indexer/internal/api"
-	"github.com/Abhinav7903/bitcoin-indexer/internal/config"
+	"github.com/Abhinav7903/Bitcoin-Indexer/internal/api"
+	"github.com/Abhinav7903/Bitcoin-Indexer/internal/config"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 )

@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Abhinav7903/bitcoin-indexer/internal/db"
-	"github.com/Abhinav7903/bitcoin-indexer/internal/models"
-	"github.com/Abhinav7903/bitcoin-indexer/pkg/rpc"
+	"github.com/Abhinav7903/Bitcoin-Indexer/internal/db"
+	"github.com/Abhinav7903/Bitcoin-Indexer/internal/models"
+	"github.com/Abhinav7903/Bitcoin-Indexer/pkg/rpc"
 )
 
 type Pipeline struct {
