@@ -78,7 +78,6 @@ func main() {
 	)
 	totalStart := time.Now()
 
-	// Verify PK has role — required for both receiver and sender ON CONFLICT
 	if err := verifyPK(ctx, pool); err != nil {
 		slog.Error("pk check failed", "err", err)
 		os.Exit(1)
@@ -130,7 +129,6 @@ func main() {
 	slog.Info("Backfill complete", "total_duration", time.Since(totalStart).Round(time.Second))
 }
 
-// verifyPK checks that the PK includes role — required for separate receiver/sender rows
 func verifyPK(ctx context.Context, pool *pgxpool.Pool) error {
 	var indexdef string
 	err := pool.QueryRow(ctx, `
@@ -142,11 +140,9 @@ func verifyPK(ctx context.Context, pool *pgxpool.Pool) error {
 	if err != nil {
 		return fmt.Errorf("check pk: %w", err)
 	}
-
 	if indexdef == "missing" {
-		return fmt.Errorf("address_transactions has NO primary key — run:\nALTER TABLE address_transactions ADD CONSTRAINT address_transactions_pkey PRIMARY KEY (address, block_height, tx_index, txid, role)")
+		return fmt.Errorf("address_transactions has NO primary key\nrun: ALTER TABLE address_transactions ADD CONSTRAINT address_transactions_pkey PRIMARY KEY (address, block_height, tx_index, txid, role)")
 	}
-
 	hasRole := false
 	for i := 0; i+4 <= len(indexdef); i++ {
 		if indexdef[i:i+4] == "role" {
@@ -154,18 +150,13 @@ func verifyPK(ctx context.Context, pool *pgxpool.Pool) error {
 			break
 		}
 	}
-
 	if !hasRole {
-		return fmt.Errorf("PK does not include role — cannot safely insert separate sender/receiver rows.\nRun:\nALTER TABLE address_transactions DROP CONSTRAINT address_transactions_pkey;\nALTER TABLE address_transactions ADD CONSTRAINT address_transactions_pkey PRIMARY KEY (address, block_height, tx_index, txid, role);")
+		return fmt.Errorf("PK does not include role\nrun: ALTER TABLE address_transactions DROP CONSTRAINT address_transactions_pkey; ALTER TABLE address_transactions ADD CONSTRAINT address_transactions_pkey PRIMARY KEY (address, block_height, tx_index, txid, role)")
 	}
-
-	slog.Info("PK verified — includes role", "ok", true)
+	slog.Info("PK verified — includes role")
 	return nil
 }
 
-// makeJobs creates a buffered job channel large enough to hold all jobs
-// avoiding the deadlock where main goroutine blocks sending to a full channel
-// while workers are blocked waiting to log results
 func makeJobs[T any](items []T) chan T {
 	ch := make(chan T, len(items))
 	for _, item := range items {
@@ -177,9 +168,6 @@ func makeJobs[T any](items []T) chan T {
 
 func backfillReceivers(ctx context.Context, pool *pgxpool.Pool, start, end, batch, workers int32) error {
 	type job struct{ from, to int32 }
-
-	// FIX: pre-build all jobs and close channel before starting workers
-	// This avoids the deadlock where main blocks sending while workers block logging
 	var allJobs []job
 	for cur := start; cur <= end; cur += batch {
 		next := cur + batch - 1
@@ -203,24 +191,27 @@ func backfillReceivers(ctx context.Context, pool *pgxpool.Pool, start, end, batc
 			defer wg.Done()
 			for j := range jobs {
 				t := time.Now()
+				// Drive from transactions (correct partition pruning by block_height)
+				// then join tx_outputs — avoids wrong partition pruning on block_height
 				tag, err := pool.Exec(ctx, `
 INSERT INTO address_transactions (
 	address, block_height, tx_index, txid, role, net_value_sats, block_time
 )
 SELECT
 	o.address,
-	o.block_height,
+	t.block_height,
 	t.tx_index,
-	o.txid,
+	t.txid,
 	$1,
 	SUM(o.value_sats),
 	b.block_time
-FROM tx_outputs o
-JOIN transactions t ON t.block_height = o.block_height AND t.txid = o.txid
-JOIN blocks b ON b.height = o.block_height
-WHERE o.address IS NOT NULL
-  AND o.block_height BETWEEN $2 AND $3
-GROUP BY o.address, o.block_height, t.tx_index, o.txid, b.block_time
+FROM transactions t
+JOIN blocks b ON b.height = t.block_height
+JOIN tx_outputs o ON o.txid = t.txid
+                 AND o.block_height = t.block_height
+                 AND o.address IS NOT NULL
+WHERE t.block_height BETWEEN $2 AND $3
+GROUP BY o.address, t.block_height, t.tx_index, t.txid, b.block_time
 ON CONFLICT (address, block_height, tx_index, txid, role) DO NOTHING
 `, models.RoleReceiver, j.from, j.to)
 
@@ -257,7 +248,6 @@ ON CONFLICT (address, block_height, tx_index, txid, role) DO NOTHING
 
 func backfillSenders(ctx context.Context, pool *pgxpool.Pool, start, end, batch, workers int32) error {
 	type job struct{ from, to int32 }
-
 	var allJobs []job
 	for cur := start; cur <= end; cur += batch {
 		next := cur + batch - 1
@@ -281,27 +271,30 @@ func backfillSenders(ctx context.Context, pool *pgxpool.Pool, start, end, batch,
 			defer wg.Done()
 			for j := range jobs {
 				t := time.Now()
+				// KEY FIX: drive from transactions partitioned by block_height (spending tx)
+				// then join tx_outputs via spending_txid index
+				// This correctly finds ALL outputs spent in this block range
+				// regardless of which partition the output lives in
 				tag, err := pool.Exec(ctx, `
 INSERT INTO address_transactions (
 	address, block_height, tx_index, txid, role, net_value_sats, block_time
 )
 SELECT
 	o.address,
-	o.spent_height,
+	t.block_height,
 	t.tx_index,
-	o.spending_txid,
+	t.txid,
 	$1,
 	-SUM(o.value_sats),
 	b.block_time
-FROM tx_outputs o
-JOIN transactions t ON t.block_height = o.spent_height AND t.txid = o.spending_txid
-JOIN blocks b ON b.height = o.spent_height
-WHERE o.is_spent      = TRUE
-  AND o.address       IS NOT NULL
-  AND o.spending_txid IS NOT NULL
-  AND o.spent_height  IS NOT NULL
-  AND o.spent_height  BETWEEN $2 AND $3
-GROUP BY o.address, o.spent_height, t.tx_index, o.spending_txid, b.block_time
+FROM transactions t
+JOIN blocks b ON b.height = t.block_height
+JOIN tx_outputs o ON o.spending_txid = t.txid
+                 AND o.is_spent = TRUE
+                 AND o.address IS NOT NULL
+WHERE t.block_height BETWEEN $2 AND $3
+  AND t.is_coinbase = FALSE
+GROUP BY o.address, t.block_height, t.tx_index, t.txid, b.block_time
 ON CONFLICT (address, block_height, tx_index, txid, role) DO NOTHING
 `, models.RoleSender, j.from, j.to)
 
@@ -373,18 +366,24 @@ SELECT
 	MAX(block_height)    AS last_seen_height,
 	MAX(block_height)    AS updated_at_height
 FROM (
+	-- received: outputs sent to this address
 	SELECT address, txid, block_height,
 	       value_sats AS delta, value_sats AS received, 0 AS sent
 	FROM tx_outputs
-	WHERE address IS NOT NULL AND address LIKE $1 || '%'
+	WHERE address IS NOT NULL
+	  AND address LIKE $1 || '%'
 
 	UNION ALL
 
+	-- sent: outputs from this address that were spent
 	SELECT address, spending_txid AS txid, spent_height AS block_height,
 	       -value_sats AS delta, 0 AS received, value_sats AS sent
 	FROM tx_outputs
-	WHERE address IS NOT NULL AND address LIKE $1 || '%'
-	  AND is_spent = TRUE AND spending_txid IS NOT NULL AND spent_height IS NOT NULL
+	WHERE address IS NOT NULL
+	  AND address LIKE $1 || '%'
+	  AND is_spent = TRUE
+	  AND spending_txid IS NOT NULL
+	  AND spent_height IS NOT NULL
 ) combined
 GROUP BY address
 ON CONFLICT (address) DO UPDATE SET
