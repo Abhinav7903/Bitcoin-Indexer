@@ -21,23 +21,20 @@ type BackfillConfig struct {
 	StartHeight   int32  `yaml:"start_height"`
 	EndHeight     int32  `yaml:"end_height"`
 	Workers       int32  `yaml:"workers"`
-	SkipReceivers bool   `yaml:"skip_receivers"`
-	SkipSenders   bool   `yaml:"skip_senders"`
-	SkipBalances  bool   `yaml:"skip_balances"`
-	SkipUTXO      bool   `yaml:"skip_utxo_counts"`
+	SkipSpend     bool   `yaml:"skip_spend"`      // Step 0: mark is_spent on tx_outputs
+	SkipReceivers bool   `yaml:"skip_receivers"`  // Step 1
+	SkipSenders   bool   `yaml:"skip_senders"`    // Step 2
+	SkipBalances  bool   `yaml:"skip_balances"`   // Step 3
+	SkipUTXO      bool   `yaml:"skip_utxo_counts"` // Step 4
 }
 
-// txPartition defines one transactions_* leaf table and its block range.
-type txPartition struct {
-	txTable  string // e.g. "transactions_200k_300k"
-	outTable string // e.g. "tx_outputs_200k_300k"  — used for receiver step
+// knownPartitions pairs tx table with tx_outputs table for the same height range.
+var knownPartitions = []struct {
+	txTable  string
+	outTable string
 	from     int32
 	to       int32
-}
-
-// allTxPartitions returns every leaf partition in block-height order.
-// Each entry pairs the tx table with its matching tx_outputs table.
-var knownPartitions = []txPartition{
+}{
 	{"transactions_0_100k", "tx_outputs_0_100k", 0, 99999},
 	{"transactions_100k_200k", "tx_outputs_100k_200k", 100000, 199999},
 	{"transactions_200k_300k", "tx_outputs_200k_300k", 200000, 299999},
@@ -52,22 +49,47 @@ var knownPartitions = []txPartition{
 	{"transactions_default", "tx_outputs_default", 1100000, 9999999},
 }
 
-func filteredPartitions(start, end int32) []txPartition {
-	var result []txPartition
-	for _, p := range knownPartitions {
-		if p.to < start || p.from > end {
-			continue
+// tx_inputs partitions — spending data lives here
+var inputPartitions = []struct {
+	inTable string
+	from    int32
+	to      int32
+}{
+	{"tx_inputs_0_100k", 0, 99999},
+	{"tx_inputs_100k_200k", 100000, 199999},
+	{"tx_inputs_200k_300k", 200000, 299999},
+	{"tx_inputs_300k_400k", 300000, 399999},
+	{"tx_inputs_400k_500k", 400000, 499999},
+	{"tx_inputs_500k_600k", 500000, 599999},
+	{"tx_inputs_600k_700k", 600000, 699999},
+	{"tx_inputs_700k_800k", 700000, 799999},
+	{"tx_inputs_800k_900k", 800000, 899999},
+	{"tx_inputs_900k_1m", 900000, 999999},
+	{"tx_inputs_1m_11m", 1000000, 1099999},
+	{"tx_inputs_default", 1100000, 9999999},
+}
+
+type heightRange struct{ from, to int32 }
+
+func buildBatches(from, to, batchSize int32) []heightRange {
+	var jobs []heightRange
+	for cur := from; cur <= to; cur += batchSize {
+		next := cur + batchSize - 1
+		if next > to {
+			next = to
 		}
-		clamped := p
-		if clamped.from < start {
-			clamped.from = start
-		}
-		if clamped.to > end {
-			clamped.to = end
-		}
-		result = append(result, clamped)
+		jobs = append(jobs, heightRange{cur, next})
 	}
-	return result
+	return jobs
+}
+
+func makeJobs[T any](items []T) chan T {
+	ch := make(chan T, len(items))
+	for _, item := range items {
+		ch <- item
+	}
+	close(ch)
+	return ch
 }
 
 func loadConfig(path string) (*BackfillConfig, error) {
@@ -80,7 +102,7 @@ func loadConfig(path string) (*BackfillConfig, error) {
 }
 
 func main() {
-	cfgPath := flag.String("config", "backfill_config.yaml", "path to backfill config")
+	cfgPath := flag.String("config", "backfill_config.yaml", "path to config")
 	flag.Parse()
 
 	cfg, err := loadConfig(*cfgPath)
@@ -95,7 +117,6 @@ func main() {
 		slog.Error("parse db url", "err", err)
 		os.Exit(1)
 	}
-	// Workers + 4 headroom for balance/verify queries
 	poolCfg.MaxConns = cfg.Workers + 6
 	poolCfg.MinConns = 2
 
@@ -127,10 +148,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ── Step 1: Receivers ─────────────────────────────────────────────────────
-	// Drives from tx_outputs (by block_height) → joins transactions.
-	// Uses idx_tx_brin_* and the tx_outputs PK. Fast because outputs live in
-	// the same partition as their transaction.
+	// ── Step 0: Mark Spent ───────────────────────────────────────────────────
+	// historicalSync=true skipped applySpendState during initial indexing.
+	// tx_inputs has all the spending data — use it to replay the spend pass.
+	// Drives from tx_inputs (by block_height = the spending block).
+	// Uses utxo_set to find source_height (the partition key of tx_outputs).
+	// Without source_height, UPDATE would scan all 12 tx_output partitions.
+	if !cfg.SkipSpend {
+		slog.Info("Step 0/4: Mark spent outputs (replay historicalSync spend pass)")
+		if err := backfillSpend(ctx, pool, cfg.StartHeight, end, cfg.BatchSize, cfg.Workers); err != nil {
+			slog.Error("spend marking failed", "err", err)
+			os.Exit(1)
+		}
+	} else {
+		slog.Info("Step 0 skipped")
+	}
+
+	// ── Step 1: Receivers ────────────────────────────────────────────────────
 	if !cfg.SkipReceivers {
 		slog.Info("Step 1/4: Receiver address_transactions")
 		if err := backfillReceivers(ctx, pool, cfg.StartHeight, end, cfg.BatchSize, cfg.Workers); err != nil {
@@ -141,18 +175,10 @@ func main() {
 		slog.Info("Step 1 skipped")
 	}
 
-	// ── Step 2: Senders ───────────────────────────────────────────────────────
-	// KEY FIX: drive from tx_outputs using spent_height (idx_tx_outputs_*_sh),
-	// not from transactions using spending_txid.
-	//
-	// Old approach: FROM transactions → JOIN tx_outputs ON spending_txid = t.txid
-	//   → forces cross-partition scan of all 12 tx_output partitions per batch
-	//   → 9-hour stall
-	//
-	// New approach: FROM tx_outputs WHERE spent_height BETWEEN $1 AND $2
-	//   → hits idx_tx_outputs_*_sh index directly (one partition at a time)
-	//   → joins back to transactions for block_time / tx_index via txid
-	//   → each batch touches 1 tx_output partition × 1 tx partition = fast
+	// ── Step 2: Senders ──────────────────────────────────────────────────────
+	// Now that is_spent/spending_txid/spent_height are set, drive from
+	// tx_inputs directly — same data source as the spend pass, no need for
+	// tx_outputs cross-partition join.
 	if !cfg.SkipSenders {
 		slog.Info("Step 2/4: Sender address_transactions")
 		if err := backfillSenders(ctx, pool, cfg.StartHeight, end, cfg.BatchSize, cfg.Workers); err != nil {
@@ -164,8 +190,6 @@ func main() {
 	}
 
 	// ── Step 3: Balances ─────────────────────────────────────────────────────
-	// Computed directly from tx_outputs — source of truth, no dependency on
-	// address_transactions. Always correct regardless of sender/receiver state.
 	if !cfg.SkipBalances {
 		slog.Info("Step 3/4: Address balances")
 		if err := backfillBalances(ctx, pool, cfg.Workers); err != nil {
@@ -192,7 +216,7 @@ func main() {
 	slog.Info("Backfill complete", "total_duration", time.Since(totalStart).Round(time.Second))
 }
 
-// ── verifyPK ─────────────────────────────────────────────────────────────────
+// ── verifyPK ──────────────────────────────────────────────────────────────────
 
 func verifyPK(ctx context.Context, pool *pgxpool.Pool) error {
 	var indexdef string
@@ -225,52 +249,192 @@ func verifyPK(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-func makeJobs[T any](items []T) chan T {
-	ch := make(chan T, len(items))
-	for _, item := range items {
-		ch <- item
-	}
-	close(ch)
-	return ch
-}
-
-type heightRange struct{ from, to int32 }
-
-func buildBatches(from, to, batchSize int32) []heightRange {
-	var jobs []heightRange
-	for cur := from; cur <= to; cur += batchSize {
-		next := cur + batchSize - 1
-		if next > to {
-			next = to
-		}
-		jobs = append(jobs, heightRange{cur, next})
-	}
-	return jobs
-}
-
-// ── Step 1: Receivers ─────────────────────────────────────────────────────────
+// ── Step 0: Mark Spent ────────────────────────────────────────────────────────
 //
-// Drive from tx_outputs (same partition as transactions).
-// Join condition: o.txid = t.txid AND o.block_height = t.block_height
-// Both columns are indexed on the same partition → no cross-partition scanning.
+// Drives from tx_inputs (partitioned by block_height = spending block).
+// For each batch of inputs:
+//   1. Find source_height from tx_outputs PK (txid+vout_idx → block_height)
+//      using the tx_outputs_*_pkey index — O(1) per row.
+//   2. UPDATE tx_outputs SET is_spent=TRUE, spending_txid=..., spent_height=...
+//      using source_height for partition pruning — touches exactly 1 partition.
+//
+// Safe to re-run: UPDATE is idempotent (same values written again = no-op).
+// Skips coinbase inputs (prev_txid IS NULL).
 
-func backfillReceivers(ctx context.Context, pool *pgxpool.Pool, start, end, batchSize, workers int32) error {
-	partitions := filteredPartitions(start, end)
-	grandTotal := int32(len(partitions))
-	var grandInserted atomic.Int64
+func backfillSpend(ctx context.Context, pool *pgxpool.Pool, start, end, batchSize, workers int32) error {
+	// Filter input partitions to our range
+	type inPart struct {
+		table string
+		from  int32
+		to    int32
+	}
+	var parts []inPart
+	for _, p := range inputPartitions {
+		if p.to < start || p.from > end {
+			continue
+		}
+		f, t := p.from, p.to
+		if f < start {
+			f = start
+		}
+		if t > end {
+			t = end
+		}
+		parts = append(parts, inPart{p.inTable, f, t})
+	}
 
-	for pi, p := range partitions {
-		slog.Info("receivers partition",
-			"table", p.txTable,
+	grandTotal := int32(len(parts))
+	var grandUpdated atomic.Int64
+
+	for pi, p := range parts {
+		slog.Info("spend partition",
+			"table", p.table,
 			"range", fmt.Sprintf("%d→%d", p.from, p.to),
-			"partition", fmt.Sprintf("%d/%d", pi+1, grandTotal),
+			"progress", fmt.Sprintf("%d/%d", pi+1, grandTotal),
 		)
+		partStart := time.Now()
 
 		jobs := makeJobs(buildBatches(p.from, p.to, batchSize))
 		batchCount := int32(len(buildBatches(p.from, p.to, batchSize)))
+
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var firstErr error
+		var updated atomic.Int64
+		var done atomic.Int32
+
+		for i := int32(0); i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := range jobs {
+					t0 := time.Now()
+
+					// Single query per batch:
+					// 1. Find source_height via tx_outputs PK (fast index lookup)
+					// 2. UPDATE tx_outputs with partition pruning via block_height=source_height
+					// Uses explicit input partition table — no cross-partition tx_inputs scan.
+					query := fmt.Sprintf(`
+WITH inputs AS (
+	SELECT
+		prev_txid,
+		prev_vout,
+		txid  AS spending_txid,
+		vin_idx AS spending_vin,
+		block_height AS spent_height
+	FROM %s
+	WHERE block_height BETWEEN $1 AND $2
+	  AND prev_txid IS NOT NULL
+),
+with_source AS (
+	SELECT
+		i.prev_txid,
+		i.prev_vout,
+		i.spending_txid,
+		i.spending_vin,
+		i.spent_height,
+		o.block_height AS source_height
+	FROM inputs i
+	JOIN tx_outputs o
+	  ON o.txid     = i.prev_txid
+	 AND o.vout_idx = i.prev_vout
+	WHERE o.is_spent = FALSE
+)
+UPDATE tx_outputs o
+SET
+	is_spent      = TRUE,
+	spending_txid = s.spending_txid,
+	spending_vin  = s.spending_vin,
+	spent_height  = s.spent_height
+FROM with_source s
+WHERE o.txid         = s.prev_txid
+  AND o.vout_idx     = s.prev_vout
+  AND o.block_height = s.source_height
+`, p.table)
+
+					tag, err := pool.Exec(ctx, query, j.from, j.to)
+					if err != nil {
+						mu.Lock()
+						if firstErr == nil {
+							firstErr = fmt.Errorf("spend %s %d-%d: %w", p.table, j.from, j.to, err)
+						}
+						mu.Unlock()
+						return
+					}
+					n := done.Add(1)
+					upd := updated.Add(tag.RowsAffected())
+					slog.Info("spend batch",
+						"table", p.table,
+						"range", fmt.Sprintf("%d→%d", j.from, j.to),
+						"updated", tag.RowsAffected(),
+						"partition_total", upd,
+						"progress", fmt.Sprintf("%d/%d", n, batchCount),
+						"dur", time.Since(t0).Round(time.Millisecond),
+					)
+				}
+			}()
+		}
+
+		wg.Wait()
+		mu.Lock()
+		partErr := firstErr
+		mu.Unlock()
+		if partErr != nil {
+			return partErr
+		}
+
+		partRows := updated.Load()
+		grandUpdated.Add(partRows)
+		slog.Info("spend partition done",
+			"table", p.table,
+			"updated", partRows,
+			"grand_total", grandUpdated.Load(),
+			"dur", time.Since(partStart).Round(time.Second),
+		)
+	}
+
+	slog.Info("spend done", "total_updated", grandUpdated.Load())
+	return nil
+}
+
+// ── Step 1: Receivers ─────────────────────────────────────────────────────────
+// Drive from tx_outputs partition directly — same partition as transactions.
+
+func backfillReceivers(ctx context.Context, pool *pgxpool.Pool, start, end, batchSize, workers int32) error {
+	type part struct {
+		txTable  string
+		outTable string
+		from     int32
+		to       int32
+	}
+	var parts []part
+	for _, p := range knownPartitions {
+		if p.to < start || p.from > end {
+			continue
+		}
+		f, t := p.from, p.to
+		if f < start {
+			f = start
+		}
+		if t > end {
+			t = end
+		}
+		parts = append(parts, part{p.txTable, p.outTable, f, t})
+	}
+
+	grandTotal := int32(len(parts))
+	var grandInserted atomic.Int64
+
+	for pi, p := range parts {
+		slog.Info("receivers partition",
+			"table", p.txTable,
+			"range", fmt.Sprintf("%d→%d", p.from, p.to),
+			"progress", fmt.Sprintf("%d/%d", pi+1, grandTotal),
+		)
 		partStart := time.Now()
+
+		jobs := makeJobs(buildBatches(p.from, p.to, batchSize))
+		batchCount := int32(len(buildBatches(p.from, p.to, batchSize)))
 
 		var wg sync.WaitGroup
 		var mu sync.Mutex
@@ -283,9 +447,7 @@ func backfillReceivers(ctx context.Context, pool *pgxpool.Pool, start, end, batc
 			go func() {
 				defer wg.Done()
 				for j := range jobs {
-					t := time.Now()
-					// Drive from tx_outputs partition directly — avoids parent table scan.
-					// o.block_height BETWEEN $2 AND $3 uses the BRIN index on tx_outputs.
+					t0 := time.Now()
 					query := fmt.Sprintf(`
 INSERT INTO address_transactions (
 	address, block_height, tx_index, txid, role, net_value_sats, block_time
@@ -299,8 +461,7 @@ SELECT
 	SUM(o.value_sats),
 	b.block_time
 FROM %s o
-JOIN %s t  ON t.txid = o.txid
-           AND t.block_height = o.block_height
+JOIN %s t  ON t.txid = o.txid AND t.block_height = o.block_height
 JOIN blocks b ON b.height = t.block_height
 WHERE o.block_height BETWEEN $2 AND $3
   AND o.address IS NOT NULL
@@ -324,8 +485,8 @@ ON CONFLICT (address, block_height, tx_index, txid, role) DO NOTHING
 						"range", fmt.Sprintf("%d→%d", j.from, j.to),
 						"rows", tag.RowsAffected(),
 						"partition_total", ins,
-						"batch_progress", fmt.Sprintf("%d/%d", n, batchCount),
-						"dur", time.Since(t).Round(time.Millisecond),
+						"progress", fmt.Sprintf("%d/%d", n, batchCount),
+						"dur", time.Since(t0).Round(time.Millisecond),
 					)
 				}
 			}()
@@ -354,52 +515,44 @@ ON CONFLICT (address, block_height, tx_index, txid, role) DO NOTHING
 }
 
 // ── Step 2: Senders ───────────────────────────────────────────────────────────
-//
-// THE KEY FIX — drive from tx_outputs using spent_height, NOT from transactions.
-//
-// Why this works:
-//   tx_outputs.spent_height is indexed by idx_tx_outputs_*_sh on EVERY partition.
-//   Filtering WHERE spent_height BETWEEN $2 AND $3 hits a single partition's
-//   index and returns only the rows spent in that height range.
-//   The join back to transactions is a PK lookup (txid) on the matching partition.
-//
-// Why the old approach failed:
-//   FROM transactions → JOIN tx_outputs ON spending_txid = t.txid
-//   PostgreSQL must scan all 12 tx_output partitions per transactions batch
-//   because spending_txid can point to outputs created at any block height.
-//   That's 144 partition combinations → BufferIO stall for 9+ hours.
-//
-// Partition-by-output-partition strategy:
-//   We loop over each tx_outputs partition (by the HEIGHT range the outputs
-//   were CREATED in, not spent). Within each, we batch by spent_height so
-//   each batch is small and uses the _sh index.
-//   The join to transactions uses the explicit tx partition table that matches
-//   the spent_height range — this is safe because:
-//     spent_height is the block that spent the output = the block the spending
-//     tx lives in = the correct tx partition.
-//   We therefore need to iterate over ALL tx_output partitions (outputs can
-//   be spent at any height), but within each output partition we only touch
-//   one tx partition at a time via spent_height batches.
+// Drive from tx_inputs (partitioned by spending block_height).
+// After Step 0, tx_outputs has is_spent=TRUE + source_height available via
+// the JOIN. Uses explicit input partition — no cross-partition scan.
 
 func backfillSenders(ctx context.Context, pool *pgxpool.Pool, start, end, batchSize, workers int32) error {
-	// For senders we iterate over ALL output partitions (any output can be spent
-	// in our target height range), but we filter by spent_height BETWEEN start AND end.
-	allOutPartitions := allOutputPartitions()
-	grandTotal := int32(len(allOutPartitions))
+	type inPart struct {
+		table string
+		from  int32
+		to    int32
+	}
+	var parts []inPart
+	for _, p := range inputPartitions {
+		if p.to < start || p.from > end {
+			continue
+		}
+		f, t := p.from, p.to
+		if f < start {
+			f = start
+		}
+		if t > end {
+			t = end
+		}
+		parts = append(parts, inPart{p.inTable, f, t})
+	}
+
+	grandTotal := int32(len(parts))
 	var grandInserted atomic.Int64
 
-	for pi, outP := range allOutPartitions {
-		slog.Info("senders output-partition",
-			"out_table", outP.table,
+	for pi, p := range parts {
+		slog.Info("senders partition",
+			"table", p.table,
+			"range", fmt.Sprintf("%d→%d", p.from, p.to),
 			"progress", fmt.Sprintf("%d/%d", pi+1, grandTotal),
 		)
 		partStart := time.Now()
 
-		// Within this output partition, batch by spent_height in our range.
-		// Each batch hits idx_tx_outputs_*_sh for the output table, then
-		// looks up the matching tx partition via spent_height → block_height.
-		jobs := makeJobs(buildBatches(start, end, batchSize))
-		batchCount := int32(len(buildBatches(start, end, batchSize)))
+		jobs := makeJobs(buildBatches(p.from, p.to, batchSize))
+		batchCount := int32(len(buildBatches(p.from, p.to, batchSize)))
 
 		var wg sync.WaitGroup
 		var mu sync.Mutex
@@ -412,43 +565,43 @@ func backfillSenders(ctx context.Context, pool *pgxpool.Pool, start, end, batchS
 			go func() {
 				defer wg.Done()
 				for j := range jobs {
-					t := time.Now()
-					// Drive from this output partition filtered by spent_height.
-					// spent_height = the block that spent the output = tx block_height.
-					// We join to the transactions PARENT table (uses partition pruning
-					// via block_height = o.spent_height which is a constant per row,
-					// so PG can prune to the right tx partition automatically).
-					// Then join blocks for block_time.
+					t0 := time.Now()
+					// Drive from tx_inputs partition.
+					// Join tx_outputs using (prev_txid, prev_vout) — after Step 0
+					// is_spent=TRUE so we can also filter on that for safety.
+					// source_height from tx_outputs.block_height enables partition pruning.
 					query := fmt.Sprintf(`
 INSERT INTO address_transactions (
 	address, block_height, tx_index, txid, role, net_value_sats, block_time
 )
 SELECT
 	o.address,
-	o.spent_height             AS block_height,
+	i.block_height        AS block_height,
 	t.tx_index,
-	o.spending_txid            AS txid,
+	i.txid                AS txid,
 	$1,
 	-SUM(o.value_sats),
 	b.block_time
-FROM %s o
-JOIN transactions t  ON t.txid = o.spending_txid
-                    AND t.block_height = o.spent_height
-JOIN blocks b        ON b.height = o.spent_height
-WHERE o.is_spent        = TRUE
-  AND o.spending_txid  IS NOT NULL
-  AND o.spent_height   IS NOT NULL
-  AND o.address        IS NOT NULL
-  AND o.spent_height BETWEEN $2 AND $3
-GROUP BY o.address, o.spent_height, t.tx_index, o.spending_txid, b.block_time
+FROM %s i
+JOIN tx_outputs o
+  ON o.txid     = i.prev_txid
+ AND o.vout_idx = i.prev_vout
+JOIN transactions t
+  ON t.txid         = i.txid
+ AND t.block_height = i.block_height
+JOIN blocks b ON b.height = i.block_height
+WHERE i.block_height BETWEEN $2 AND $3
+  AND i.prev_txid IS NOT NULL
+  AND o.address IS NOT NULL
+GROUP BY o.address, i.block_height, t.tx_index, i.txid, b.block_time
 ON CONFLICT (address, block_height, tx_index, txid, role) DO NOTHING
-`, outP.table)
+`, p.table)
 
 					tag, err := pool.Exec(ctx, query, models.RoleSender, j.from, j.to)
 					if err != nil {
 						mu.Lock()
 						if firstErr == nil {
-							firstErr = fmt.Errorf("sender %s %d-%d: %w", outP.table, j.from, j.to, err)
+							firstErr = fmt.Errorf("sender %s %d-%d: %w", p.table, j.from, j.to, err)
 						}
 						mu.Unlock()
 						return
@@ -456,12 +609,12 @@ ON CONFLICT (address, block_height, tx_index, txid, role) DO NOTHING
 					n := done.Add(1)
 					ins := inserted.Add(tag.RowsAffected())
 					slog.Info("senders batch",
-						"out_table", outP.table,
+						"table", p.table,
 						"range", fmt.Sprintf("%d→%d", j.from, j.to),
 						"rows", tag.RowsAffected(),
 						"partition_total", ins,
-						"batch_progress", fmt.Sprintf("%d/%d", n, batchCount),
-						"dur", time.Since(t).Round(time.Millisecond),
+						"progress", fmt.Sprintf("%d/%d", n, batchCount),
+						"dur", time.Since(t0).Round(time.Millisecond),
 					)
 				}
 			}()
@@ -477,8 +630,8 @@ ON CONFLICT (address, block_height, tx_index, txid, role) DO NOTHING
 
 		partRows := inserted.Load()
 		grandInserted.Add(partRows)
-		slog.Info("senders output-partition done",
-			"out_table", outP.table,
+		slog.Info("senders partition done",
+			"table", p.table,
 			"rows_inserted", partRows,
 			"grand_total", grandInserted.Load(),
 			"dur", time.Since(partStart).Round(time.Second),
@@ -489,38 +642,12 @@ ON CONFLICT (address, block_height, tx_index, txid, role) DO NOTHING
 	return nil
 }
 
-// outputPartition is the tx_outputs leaf table info for sender iteration.
-type outputPartition struct {
-	table string
-}
-
-func allOutputPartitions() []outputPartition {
-	return []outputPartition{
-		{"tx_outputs_0_100k"},
-		{"tx_outputs_100k_200k"},
-		{"tx_outputs_200k_300k"},
-		{"tx_outputs_300k_400k"},
-		{"tx_outputs_400k_500k"},
-		{"tx_outputs_500k_600k"},
-		{"tx_outputs_600k_700k"},
-		{"tx_outputs_700k_800k"},
-		{"tx_outputs_800k_900k"},
-		{"tx_outputs_900k_1m"},
-		{"tx_outputs_1m_11m"},
-		{"tx_outputs_default"},
-	}
-}
-
 // ── Step 3: Balances ──────────────────────────────────────────────────────────
-//
-// Computed directly from tx_outputs — independent source of truth.
-// Prefix-based parallelism avoids full table locks.
-// address LIKE $1||'%' uses partial indexes if present, or BRIN otherwise.
 
 func backfillBalances(ctx context.Context, pool *pgxpool.Pool, workers int32) error {
 	slog.Info("Truncating address_balances for full rebuild...")
 	if _, err := pool.Exec(ctx, "TRUNCATE address_balances"); err != nil {
-		return fmt.Errorf("truncate address_balances: %w", err)
+		return fmt.Errorf("truncate: %w", err)
 	}
 
 	prefixes := addressPrefixes()
@@ -538,7 +665,7 @@ func backfillBalances(ctx context.Context, pool *pgxpool.Pool, workers int32) er
 		go func() {
 			defer wg.Done()
 			for p := range jobs {
-				t := time.Now()
+				t0 := time.Now()
 				_, err := pool.Exec(ctx, `
 INSERT INTO address_balances (
 	address, balance_sats, total_received_sats, total_sent_sats,
@@ -554,21 +681,17 @@ SELECT
 	MAX(block_height)    AS last_seen_height,
 	MAX(block_height)    AS updated_at_height
 FROM (
-	-- received: output created for this address
 	SELECT address, txid, block_height,
 	       value_sats AS delta, value_sats AS received, 0 AS sent
 	FROM tx_outputs
-	WHERE address IS NOT NULL
-	  AND address LIKE $1 || '%'
+	WHERE address IS NOT NULL AND address LIKE $1 || '%'
 
 	UNION ALL
 
-	-- spent: output from this address consumed by another tx
 	SELECT address, spending_txid AS txid, spent_height AS block_height,
 	       -value_sats AS delta, 0 AS received, value_sats AS sent
 	FROM tx_outputs
-	WHERE address IS NOT NULL
-	  AND address LIKE $1 || '%'
+	WHERE address IS NOT NULL AND address LIKE $1 || '%'
 	  AND is_spent = TRUE
 	  AND spending_txid IS NOT NULL
 	  AND spent_height IS NOT NULL
@@ -583,7 +706,6 @@ ON CONFLICT (address) DO UPDATE SET
 	last_seen_height    = GREATEST(address_balances.last_seen_height, EXCLUDED.last_seen_height),
 	updated_at_height   = GREATEST(address_balances.updated_at_height, EXCLUDED.updated_at_height)
 `, p)
-
 				if err != nil {
 					mu.Lock()
 					if firstErr == nil {
@@ -593,11 +715,9 @@ ON CONFLICT (address) DO UPDATE SET
 					return
 				}
 				n := done.Add(1)
-				slog.Info("balances",
-					"prefix", p,
+				slog.Info("balances", "prefix", p,
 					"progress", fmt.Sprintf("%d/%d", n, total),
-					"dur", time.Since(t).Round(time.Millisecond),
-				)
+					"dur", time.Since(t0).Round(time.Millisecond))
 			}
 		}()
 	}
@@ -651,10 +771,7 @@ WHERE b.address = u.address
 					return
 				}
 				n := done.Add(1)
-				slog.Info("utxo counts",
-					"prefix", p,
-					"progress", fmt.Sprintf("%d/%d", n, total),
-				)
+				slog.Info("utxo counts", "prefix", p, "progress", fmt.Sprintf("%d/%d", n, total))
 			}
 		}()
 	}
@@ -672,19 +789,16 @@ WHERE b.address = u.address
 // ── Verify ────────────────────────────────────────────────────────────────────
 
 func verifyBackfill(ctx context.Context, pool *pgxpool.Pool) {
-	checks := []struct {
-		name  string
-		query string
-	}{
+	checks := []struct{ name, query string }{
 		{"address_balances count", "SELECT COUNT(*) FROM address_balances"},
 		{"address_transactions count", "SELECT COUNT(*) FROM address_transactions"},
 		{"receiver rows (role=0)", fmt.Sprintf("SELECT COUNT(*) FROM address_transactions WHERE role = %d", models.RoleReceiver)},
 		{"sender rows (role=1)", fmt.Sprintf("SELECT COUNT(*) FROM address_transactions WHERE role = %d", models.RoleSender)},
 		{"negative balances (want 0)", "SELECT COUNT(*) FROM address_balances WHERE balance_sats < 0"},
+		{"spent outputs total", "SELECT COUNT(*) FROM tx_outputs WHERE is_spent = TRUE"},
 		{"utxo_set count", "SELECT COUNT(*) FROM utxo_set"},
 		{"last_indexed_height", "SELECT last_indexed_height FROM index_state WHERE id = 1"},
 	}
-
 	for _, c := range checks {
 		var val int64
 		if err := pool.QueryRow(ctx, c.query).Scan(&val); err != nil {
@@ -696,19 +810,13 @@ func verifyBackfill(ctx context.Context, pool *pgxpool.Pool) {
 }
 
 // ── addressPrefixes ───────────────────────────────────────────────────────────
-// Bitcoin addresses use Base58 (no 0, O, I, l).
-// Bech32 addresses start with 'b' (bc1...). Taproot also 'b'.
-// This covers all realistic first characters.
 
 func addressPrefixes() []string {
 	return []string{
-		// digits (Base58 — no 0)
 		"1", "2", "3", "4", "5", "6", "7", "8", "9",
-		// lowercase (Base58 excludes l; bech32 uses a-z)
 		"a", "b", "c", "d", "e", "f", "g", "h", "i", "j",
 		"k", "m", "n", "o", "p", "q", "r", "s", "t",
 		"u", "v", "w", "x", "y", "z",
-		// uppercase (Base58 excludes I, O)
 		"A", "B", "C", "D", "E", "F", "G", "H", "J",
 		"K", "L", "M", "N", "P", "Q", "R", "S", "T",
 		"U", "V", "W", "X", "Y", "Z",
