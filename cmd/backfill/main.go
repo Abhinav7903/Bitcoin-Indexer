@@ -244,113 +244,84 @@ func verifyPK(ctx context.Context, pool *pgxpool.Pool) error {
 // idx_txin_prev_* index on (prev_txid, prev_vout) makes each pair fast.
 // No block_height range on tx_inputs — avoids BRIN scan, uses btree index.
 
-type spendPair struct {
-	outTable string
-	inTable  string
-	pairNum  int
-	total    int
-}
+func backfillSpend(ctx context.Context, pool *pgxpool.Pool, start, end int32, _ int32) error {
+	// CRITICAL: spend marking must run ONE PAIR AT A TIME (sequential).
+	
 
-func backfillSpend(ctx context.Context, pool *pgxpool.Pool, start, end int32, workers int32) error {
-	// Build all 144 pairs but only include output partitions that overlap
-	// with our target range (outputs that could have been spent in start→end).
-	// For spend marking we process ALL output partitions since any output
-	// can be spent in our range. Filter by spending input partition range.
-	var pairs []spendPair
+	startTime := time.Now()
+	var grandUpdated int64
+	pairNum := 0
+
+	// Count total pairs for progress reporting
+	totalPairs := 0
 	for _, outP := range allPartitions {
 		for _, inP := range allPartitions {
-			// Only include input partitions within our target spending range
 			if inP.to < start || inP.from > end {
 				continue
 			}
-			pairs = append(pairs, spendPair{
-				outTable: outP.outTable,
-				inTable:  inP.inTable,
-			})
+			_ = outP
+			totalPairs++
 		}
 	}
-	// Set pair numbers
-	for i := range pairs {
-		pairs[i].pairNum = i + 1
-		pairs[i].total = len(pairs)
-	}
 
-	jobs := makeJobs(pairs)
-	var grandUpdated atomic.Int64
-	var mu sync.Mutex
-	var firstErr error
-	var wg sync.WaitGroup
-	startTime := time.Now()
+	for oi, outP := range allPartitions {
+		outStart := time.Now()
+		var outUpdated int64
 
-	for i := int32(0); i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for pair := range jobs {
-				t0 := time.Now()
-
-				// THE KEY QUERY:
-				// - UPDATE explicit output partition (no cross-partition write)
-				// - FROM explicit input partition (idx_txin_prev_* index lookup)
-				// - No block_height filter on inputs → pure index nested loop
-				// - Only update rows where is_spent=FALSE → idempotent
-				query := fmt.Sprintf(`
-						UPDATE %s o
-						SET
-							is_spent      = TRUE,
-							spending_txid = i.txid,
-							spending_vin  = i.vin_idx,
-							spent_height  = i.block_height
-						FROM %s i
-						WHERE i.prev_txid = o.txid
-						AND i.prev_vout = o.vout_idx
-						AND o.is_spent  = FALSE
-						`, pair.outTable, pair.inTable)
-
-				tag, err := pool.Exec(ctx, query)
-				if err != nil {
-					mu.Lock()
-					if firstErr == nil {
-						firstErr = fmt.Errorf("spend %s←%s: %w", pair.outTable, pair.inTable, err)
-					}
-					mu.Unlock()
-					return
-				}
-
-				upd := grandUpdated.Add(tag.RowsAffected())
-				dur := time.Since(t0).Round(time.Millisecond)
-
-				if tag.RowsAffected() > 0 {
-					slog.Info("spend pair",
-						"out", pair.outTable,
-						"in", pair.inTable,
-						"updated", tag.RowsAffected(),
-						"grand_total", upd,
-						"progress", fmt.Sprintf("%d/%d", pair.pairNum, pair.total),
-						"dur", dur,
-					)
-				} else {
-					// Log every 10 empty pairs so we can see progress
-					if pair.pairNum%10 == 0 {
-						slog.Info("spend progress",
-							"progress", fmt.Sprintf("%d/%d", pair.pairNum, pair.total),
-							"grand_total", upd,
-							"elapsed", time.Since(startTime).Round(time.Second),
-						)
-					}
-				}
+		for _, inP := range allPartitions {
+			// Skip input partitions outside our target range
+			if inP.to < start || inP.from > end {
+				continue
 			}
-		}()
+			pairNum++
+			t0 := time.Now()
+
+			query := fmt.Sprintf(`
+				UPDATE %s o
+				SET
+					is_spent      = TRUE,
+					spending_txid = i.txid,
+					spending_vin  = i.vin_idx,
+					spent_height  = i.block_height
+				FROM %s i
+				WHERE i.prev_txid = o.txid
+				  AND i.prev_vout = o.vout_idx
+				  AND o.is_spent  = FALSE
+			`, outP.outTable, inP.inTable)
+
+			tag, err := pool.Exec(ctx, query)
+			if err != nil {
+				return fmt.Errorf("spend %s←%s: %w", outP.outTable, inP.inTable, err)
+			}
+
+			rows := tag.RowsAffected()
+			outUpdated += rows
+			grandUpdated += rows
+
+			if rows > 0 {
+				slog.Info("spend pair",
+					"out", outP.outTable,
+					"in", inP.inTable,
+					"updated", rows,
+					"grand_total", grandUpdated,
+					"progress", fmt.Sprintf("%d/%d", pairNum, totalPairs),
+					"dur", time.Since(t0).Round(time.Millisecond),
+				)
+			}
+		}
+
+		slog.Info("spend output partition done",
+			"out", outP.outTable,
+			"partition_updated", outUpdated,
+			"grand_total", grandUpdated,
+			"progress", fmt.Sprintf("%d/%d output partitions", oi+1, len(allPartitions)),
+			"partition_dur", time.Since(outStart).Round(time.Second),
+			"elapsed", time.Since(startTime).Round(time.Second),
+		)
 	}
 
-	wg.Wait()
-	mu.Lock()
-	defer mu.Unlock()
-	if firstErr != nil {
-		return firstErr
-	}
 	slog.Info("spend done",
-		"total_updated", grandUpdated.Load(),
+		"total_updated", grandUpdated,
 		"duration", time.Since(startTime).Round(time.Second),
 	)
 	return nil
